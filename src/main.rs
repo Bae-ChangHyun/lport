@@ -40,6 +40,7 @@ struct Entry {
     cmdline: String,
     docker: Option<DockerInfo>,
     stats: Stats,
+    user_launched: bool,
 }
 
 enum Mode {
@@ -75,7 +76,7 @@ fn main() {
             entries.retain(|e| ports.contains(&e.port));
         }
         Mode::Dashboard { dev: false } => {
-            entries.retain(|e| e.docker.is_some() || is_real_cwd(&e.cwd));
+            entries.retain(|e| e.docker.is_some() || e.user_launched);
         }
         Mode::Dashboard { dev: true } => {}
     }
@@ -129,8 +130,66 @@ fn parse_mode(args: &[String]) -> Mode {
     Mode::Dashboard { dev }
 }
 
-fn is_real_cwd(cwd: &str) -> bool {
-    !matches!(cwd, "" | "/" | "?" | "-")
+fn read_has_tty(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid)) else {
+        return false;
+    };
+    let Some(rparen) = stat.rfind(')') else {
+        return false;
+    };
+    let rest = &stat[rparen + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // after comm: state(0) ppid(1) pgrp(2) session(3) tty_nr(4)
+    let Some(tty) = fields.get(4).and_then(|s| s.parse::<i32>().ok()) else {
+        return false;
+    };
+    tty != 0
+}
+
+fn read_exe_basename(pid: u32) -> Option<String> {
+    let path = fs::read_link(format!("/proc/{}/exe", pid)).ok()?;
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    Some(name)
+}
+
+fn is_interpreter_exe(name: &str) -> bool {
+    // Strip trailing version digits / dots (e.g. "python3.11" -> "python")
+    let stem: String = name
+        .chars()
+        .take_while(|c| !c.is_ascii_digit() && *c != '.')
+        .collect();
+    matches!(
+        stem.as_str(),
+        "python"
+            | "node"
+            | "deno"
+            | "bun"
+            | "ruby"
+            | "java"
+            | "php"
+            | "php-fpm"
+            | "perl"
+            | "dotnet"
+            | "erl"
+            | "beam"
+            | "uvicorn"
+            | "gunicorn"
+            | "hypercorn"
+            | "daphne"
+            | "puma"
+            | "unicorn"
+            | "rails"
+    )
+}
+
+fn read_user_launched(pid: u32) -> bool {
+    if read_has_tty(pid) {
+        return true;
+    }
+    read_exe_basename(pid)
+        .as_deref()
+        .map(is_interpreter_exe)
+        .unwrap_or(false)
 }
 
 fn load_docker_ports() -> HashMap<u32, DockerInfo> {
@@ -242,6 +301,7 @@ fn parse_line(
 
     let cwd = pid.map(read_cwd).unwrap_or_else(|| "-".to_string());
     let cmdline = pid.map(read_cmdline).unwrap_or_else(|| "-".to_string());
+    let user_launched = pid.map(read_user_launched).unwrap_or(false);
     let docker = docker_map.get(&port).cloned();
 
     Some(Entry {
@@ -253,6 +313,7 @@ fn parse_line(
         cmdline,
         docker,
         stats: Stats::default(),
+        user_launched,
     })
 }
 
