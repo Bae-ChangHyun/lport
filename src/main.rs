@@ -53,6 +53,10 @@ fn main() {
         print_help();
         return;
     }
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("lport {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
 
     let mode = parse_mode(&args);
     let docker_map = load_docker_ports();
@@ -102,6 +106,8 @@ fn print_help() {
     println!("  info PORT...     Show full details for the given port(s),");
     println!("                   including Docker container CPU/MEM");
     println!("                   example: lport info 8080 5432");
+    println!("  -V, --version    Print version and exit");
+    println!("  -h, --help       Print this help and exit");
 }
 
 fn parse_mode(args: &[String]) -> Mode {
