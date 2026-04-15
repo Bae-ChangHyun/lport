@@ -1,0 +1,15 @@
+[package]
+name = "lport"
+version = "0.1.0"
+edition = "2024"
+description = "List listening ports with the folder each server was launched from."
+license = "MIT"
+repository = "https://github.com/Bae-ChangHyun/lport"
+readme = "README.md"
+
+[dependencies]
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
