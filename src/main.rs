@@ -466,6 +466,40 @@ fn nz(s: &str) -> String {
     }
 }
 
+fn shorten_path(s: &str, max: usize, home: Option<&str>) -> String {
+    if matches!(s, "" | "-" | "?" | "/") {
+        return s.to_string();
+    }
+    let mut path = s.to_string();
+    if let Some(h) = home {
+        if path == h {
+            return "~".to_string();
+        }
+        let prefix = format!("{}/", h);
+        if let Some(rest) = path.strip_prefix(&prefix) {
+            path = format!("~/{}", rest);
+        }
+    }
+    if path.chars().count() <= max {
+        return path;
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    for start in 1..parts.len() {
+        let candidate = format!("…/{}", parts[start..].join("/"));
+        if candidate.chars().count() <= max {
+            return candidate;
+        }
+    }
+    let last = parts.last().copied().unwrap_or("");
+    let cs: Vec<char> = last.chars().collect();
+    if cs.len() > max && max > 1 {
+        let kept: String = cs[cs.len() - (max - 1)..].iter().collect();
+        format!("…{}", kept)
+    } else {
+        last.to_string()
+    }
+}
+
 fn print_info(entries: &[Entry]) {
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -538,12 +572,15 @@ fn print_table(entries: &[Entry], dev_mode: bool) {
         "PROTO", "PORT", "PID", "PROCESS", "JOB", "CPU", "MEM", "UPTIME",
     ];
 
+    let home = std::env::var("HOME").ok();
+    let job_max = 50usize;
+
     let rows: Vec<Vec<String>> = entries
         .iter()
         .map(|e| {
             let (process, job) = match &e.docker {
                 Some(d) => ("docker".to_string(), d.name.clone()),
-                None => (e.process.clone(), e.cwd.clone()),
+                None => (e.process.clone(), shorten_path(&e.cwd, job_max, home.as_deref())),
             };
             vec![
                 e.proto.to_string(),
