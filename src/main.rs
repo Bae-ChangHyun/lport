@@ -96,11 +96,12 @@ fn print_help() {
     println!("Usage: lport [--dev]");
     println!("       lport info PORT [PORT ...]");
     println!();
-    println!("  (default)        실행 폴더가 있는 사용자 서버 + 도커 컨테이너만 표시");
+    println!("  (default)        Show user-launched servers and Docker containers only");
     println!("                   (PROTO PORT PID PROCESS JOB CPU MEM UPTIME)");
-    println!("  --dev            모든 리스닝 포트 표시 (시스템 데몬 포함)");
-    println!("  info PORT...     해당 포트의 상세 정보 (도커는 컨테이너 CPU/MEM 포함)");
-    println!("                   예: lport info 8080 5432");
+    println!("  --dev            Show every listening port, including system daemons");
+    println!("  info PORT...     Show full details for the given port(s),");
+    println!("                   including Docker container CPU/MEM");
+    println!("                   example: lport info 8080 5432");
 }
 
 fn parse_mode(args: &[String]) -> Mode {
@@ -202,7 +203,7 @@ fn collect(
     let output = match Command::new("ss").args(args).output() {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("ss 실행 실패: {}. iproute2(ss) 설치 필요.", e);
+            eprintln!("error: failed to run `ss`: {}. Install iproute2 (provides `ss`).", e);
             std::process::exit(1);
         }
     };
@@ -470,7 +471,7 @@ fn print_info(entries: &[Entry]) {
     let mut out = stdout.lock();
 
     if entries.is_empty() {
-        eprintln!("(일치하는 포트가 없습니다.)");
+        eprintln!("(no matching port found)");
         return;
     }
 
@@ -584,9 +585,9 @@ fn print_table(entries: &[Entry], dev_mode: bool) {
 
     if entries.is_empty() {
         if dev_mode {
-            eprintln!("\n(리스닝 포트를 찾지 못했습니다. sudo로 실행해 보세요.)");
+            eprintln!("\n(no listening ports found — try running with sudo)");
         } else {
-            eprintln!("\n(표시할 사용자 서버가 없습니다. 전체를 보려면 `lport --dev`)");
+            eprintln!("\n(no user servers to display — run `lport --dev` to see everything)");
         }
     }
 }
