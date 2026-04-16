@@ -16,20 +16,25 @@ info()  { printf '%s %s\n' "$(color '1;34' '==>')" "$1"; }
 warn()  { printf '%s %s\n' "$(color '1;33' 'warn:')" "$1" >&2; }
 err()   { printf '%s %s\n' "$(color '1;31' 'error:')" "$1" >&2; }
 
-# 1. Linux check (lport is Linux-only)
-case "$(uname -s)" in
-  Linux) ;;
+# 1. Platform check (Linux + macOS)
+OS="$(uname -s)"
+case "$OS" in
+  Linux)  REQUIRED_TOOLS="ss ps" ;;
+  Darwin) REQUIRED_TOOLS="lsof ps" ;;
   *)
-    err "lport currently supports Linux only (detected: $(uname -s))."
+    err "lport supports Linux and macOS only (detected: $OS)."
     exit 1
     ;;
 esac
 
 # 2. Required runtime tools
-for tool in ss ps; do
+for tool in $REQUIRED_TOOLS; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     warn "'$tool' not found in PATH — lport will fail at runtime."
-    warn "  install with: sudo apt install iproute2 procps   # debian/ubuntu"
+    case "$OS" in
+      Linux)  warn "  install with: sudo apt install iproute2 procps   # debian/ubuntu" ;;
+      Darwin) warn "  '$tool' ships with macOS; check your PATH." ;;
+    esac
   fi
 done
 
