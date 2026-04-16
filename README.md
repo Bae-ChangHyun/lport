@@ -1,6 +1,6 @@
 # lport
 
-> List listening ports on Linux — and **which folder each server was launched from**.
+> List listening ports on Linux and macOS — and **which folder each server was launched from**.
 
 ```
 PROTO  PORT  PID      PROCESS  JOB                                     CPU   MEM   UPTIME
@@ -74,24 +74,37 @@ $ lport info 8080 2222
 
 ## How it works
 
+On **Linux**:
+
 - `ss -tlnpH` / `ss -ulnpH` for listening sockets
 - `/proc/<pid>/cwd` and `/proc/<pid>/cmdline` for process details
 - `ps -o pid=,pcpu=,rss=,nlwp=,etime=,user=` (one batched call) for stats
+
+On **macOS**:
+
+- `lsof -nP -iTCP -sTCP:LISTEN` / `-iUDP` for listening sockets
+- `lsof -p <pids> -d cwd` (one batched call) for each process's working directory
+- `ps -o pid=,tty=,comm=,command=,pcpu=,rss=,etime=,user=` (batched) for process details and stats
+
+And on both:
+
 - `docker ps` for container/image/compose-project mapping
 - `docker stats --no-stream <name>` (only in `info` mode) for container CPU / MEM
 
-Dashboard runs in ~130 ms. The `info` subcommand adds ~1 s only when a Docker container is involved.
+Dashboard runs in ~130 ms on Linux. macOS is slightly slower because it shells out to `lsof` / `ps` instead of reading `/proc`. The `info` subcommand adds ~1 s only when a Docker container is involved.
 
 ## Requirements
 
-- Linux (uses `/proc` and `ss`)
-- `iproute2` (`ss`) and `procps` (`ps`) — present on virtually every distro
+- Linux or macOS
+- `ps` — present on every Unix
+- Linux: `iproute2` (`ss`) — present on virtually every distro
+- macOS: `lsof` — preinstalled
 - Optional: `docker` for container mapping
 
 ## Limitations
 
-- **Linux only.** macOS / BSD not supported.
-- Without `sudo`, processes owned by other users show as `?`.
+- **Unix only.** Windows is not supported.
+- Without `sudo`, processes owned by other users show as `?` (Linux) or are hidden entirely (macOS — `lsof` cannot read foreign process state without privileges).
 - Containers started with plain `docker run` (not compose) display `WORKDIR: -` — Docker doesn't record the CLI invocation directory.
 
 ## License

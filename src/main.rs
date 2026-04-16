@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::io::{self, Write};
 use std::process::Command;
+
+#[cfg(target_os = "linux")]
+use std::fs;
 
 macro_rules! outln {
     ($out:expr, $($arg:tt)*) => {{
@@ -62,14 +64,14 @@ fn main() {
     let mode = parse_mode(&args);
     let docker_map = load_docker_ports();
 
-    let mut entries = Vec::new();
-    collect("tcp", &["-tlnpH"], &docker_map, &mut entries);
-    collect("udp", &["-ulnpH"], &docker_map, &mut entries);
+    let mut entries = collect_listening(&docker_map);
 
     entries.sort_by(|a, b| {
         (a.port, a.proto, a.pid.unwrap_or(0)).cmp(&(b.port, b.proto, b.pid.unwrap_or(0)))
     });
     entries.dedup_by(|a, b| a.port == b.port && a.proto == b.proto && a.pid == b.pid);
+
+    enrich_process_info(&mut entries);
 
     match &mode {
         Mode::Info { ports } => {
@@ -130,28 +132,6 @@ fn parse_mode(args: &[String]) -> Mode {
     Mode::Dashboard { dev }
 }
 
-fn read_has_tty(pid: u32) -> bool {
-    let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid)) else {
-        return false;
-    };
-    let Some(rparen) = stat.rfind(')') else {
-        return false;
-    };
-    let rest = &stat[rparen + 1..];
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    // after comm: state(0) ppid(1) pgrp(2) session(3) tty_nr(4)
-    let Some(tty) = fields.get(4).and_then(|s| s.parse::<i32>().ok()) else {
-        return false;
-    };
-    tty != 0
-}
-
-fn read_exe_basename(pid: u32) -> Option<String> {
-    let path = fs::read_link(format!("/proc/{}/exe", pid)).ok()?;
-    let name = path.file_name()?.to_string_lossy().into_owned();
-    Some(name)
-}
-
 fn is_interpreter_exe(name: &str) -> bool {
     // Strip trailing version digits / dots (e.g. "python3.11" -> "python")
     let stem: String = name
@@ -180,16 +160,6 @@ fn is_interpreter_exe(name: &str) -> bool {
             | "unicorn"
             | "rails"
     )
-}
-
-fn read_user_launched(pid: u32) -> bool {
-    if read_has_tty(pid) {
-        return true;
-    }
-    read_exe_basename(pid)
-        .as_deref()
-        .map(is_interpreter_exe)
-        .unwrap_or(false)
 }
 
 fn load_docker_ports() -> HashMap<u32, DockerInfo> {
@@ -259,7 +229,20 @@ fn parse_port_range(s: &str) -> Option<(u32, u32)> {
     }
 }
 
-fn collect(
+// ================================================================
+// Listening port collection (platform-specific)
+// ================================================================
+
+#[cfg(target_os = "linux")]
+fn collect_listening(docker_map: &HashMap<u32, DockerInfo>) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    collect_ss("tcp", &["-tlnpH"], docker_map, &mut entries);
+    collect_ss("udp", &["-ulnpH"], docker_map, &mut entries);
+    entries
+}
+
+#[cfg(target_os = "linux")]
+fn collect_ss(
     proto: &'static str,
     args: &[&str],
     docker_map: &HashMap<u32, DockerInfo>,
@@ -274,13 +257,14 @@ fn collect(
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
-        if let Some(e) = parse_line(line, proto, docker_map) {
+        if let Some(e) = parse_ss_line(line, proto, docker_map) {
             out.push(e);
         }
     }
 }
 
-fn parse_line(
+#[cfg(target_os = "linux")]
+fn parse_ss_line(
     line: &str,
     proto: &'static str,
     docker_map: &HashMap<u32, DockerInfo>,
@@ -299,9 +283,6 @@ fn parse_line(
         None => ("?".to_string(), None),
     };
 
-    let cwd = pid.map(read_cwd).unwrap_or_else(|| "-".to_string());
-    let cmdline = pid.map(read_cmdline).unwrap_or_else(|| "-".to_string());
-    let user_launched = pid.map(read_user_launched).unwrap_or(false);
     let docker = docker_map.get(&port).cloned();
 
     Some(Entry {
@@ -309,20 +290,22 @@ fn parse_line(
         port,
         pid,
         process,
-        cwd,
-        cmdline,
+        cwd: String::new(),
+        cmdline: String::new(),
         docker,
         stats: Stats::default(),
-        user_launched,
+        user_launched: false,
     })
 }
 
+#[cfg(target_os = "linux")]
 fn parse_users(s: &str) -> (String, Option<u32>) {
     let name = extract_between(s, '"', '"').unwrap_or_else(|| "?".to_string());
     let pid = extract_pid(s);
     (name, pid)
 }
 
+#[cfg(target_os = "linux")]
 fn extract_between(s: &str, open: char, close: char) -> Option<String> {
     let start = s.find(open)? + 1;
     let rest = &s[start..];
@@ -330,6 +313,7 @@ fn extract_between(s: &str, open: char, close: char) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+#[cfg(target_os = "linux")]
 fn extract_pid(s: &str) -> Option<u32> {
     let idx = s.find("pid=")? + 4;
     let rest = &s[idx..];
@@ -339,13 +323,144 @@ fn extract_pid(s: &str) -> Option<u32> {
     rest[..end].parse().ok()
 }
 
-fn read_cwd(pid: u32) -> String {
+#[cfg(target_os = "macos")]
+fn collect_listening(docker_map: &HashMap<u32, DockerInfo>) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    collect_lsof(
+        "tcp",
+        &["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"],
+        docker_map,
+        &mut entries,
+    );
+    collect_lsof("udp", &["-nP", "-iUDP", "-Fpcn"], docker_map, &mut entries);
+    entries
+}
+
+#[cfg(target_os = "macos")]
+fn collect_lsof(
+    proto: &'static str,
+    args: &[&str],
+    docker_map: &HashMap<u32, DockerInfo>,
+    out: &mut Vec<Entry>,
+) {
+    let output = match Command::new("lsof").args(args).output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("error: failed to run `lsof`: {}.", e);
+            std::process::exit(1);
+        }
+    };
+    // lsof exits non-zero when nothing matches; that's fine, parse whatever is there.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let mut cur_pid: Option<u32> = None;
+    let mut cur_cmd: String = "?".to_string();
+    let mut has_file = false;
+    let mut cur_name: Option<String> = None;
+
+    for line in stdout.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let (tag, val) = line.split_at(1);
+        match tag {
+            "p" => {
+                if has_file {
+                    flush_lsof(proto, cur_pid, &cur_cmd, &cur_name, docker_map, out);
+                }
+                has_file = false;
+                cur_name = None;
+                cur_pid = val.parse().ok();
+                cur_cmd = "?".to_string();
+            }
+            "c" => {
+                cur_cmd = val.to_string();
+            }
+            "f" => {
+                if has_file {
+                    flush_lsof(proto, cur_pid, &cur_cmd, &cur_name, docker_map, out);
+                }
+                has_file = true;
+                cur_name = None;
+            }
+            "n" => {
+                cur_name = Some(val.to_string());
+            }
+            _ => {}
+        }
+    }
+    if has_file {
+        flush_lsof(proto, cur_pid, &cur_cmd, &cur_name, docker_map, out);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn flush_lsof(
+    proto: &'static str,
+    pid: Option<u32>,
+    cmd: &str,
+    name: &Option<String>,
+    docker_map: &HashMap<u32, DockerInfo>,
+    out: &mut Vec<Entry>,
+) {
+    let Some(name) = name else { return };
+    // Strip trailing " (LISTEN)" or similar parenthetical suffixes
+    let name_first = name.split_whitespace().next().unwrap_or(name);
+    // For UDP with an idle state (e.g. "*:5353" or "*:5353 (IDLE)") we still want the addr part.
+    let Some(port_str) = name_first.rsplit(':').next() else {
+        return;
+    };
+    let port_str = port_str.trim_end_matches(']');
+    let Ok(port) = port_str.parse::<u32>() else {
+        return;
+    };
+    if port == 0 {
+        return;
+    }
+    let docker = docker_map.get(&port).cloned();
+    out.push(Entry {
+        proto,
+        port,
+        pid,
+        process: cmd.to_string(),
+        cwd: String::new(),
+        cmdline: String::new(),
+        docker,
+        stats: Stats::default(),
+        user_launched: false,
+    });
+}
+
+// ================================================================
+// CWD / cmdline / user-launched detection (platform-specific)
+// ================================================================
+
+#[cfg(target_os = "linux")]
+fn enrich_process_info(entries: &mut [Entry]) {
+    for e in entries.iter_mut() {
+        match e.pid {
+            Some(pid) => {
+                e.cwd = read_cwd_proc(pid);
+                e.cmdline = read_cmdline_proc(pid);
+                e.user_launched = read_user_launched_proc(pid);
+            }
+            None => {
+                e.cwd = "-".to_string();
+                e.cmdline = "-".to_string();
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_cwd_proc(pid: u32) -> String {
     fs::read_link(format!("/proc/{}/cwd", pid))
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "?".to_string())
 }
 
-fn read_cmdline(pid: u32) -> String {
+#[cfg(target_os = "linux")]
+fn read_cmdline_proc(pid: u32) -> String {
     match fs::read(format!("/proc/{}/cmdline", pid)) {
         Ok(mut bytes) => {
             for b in bytes.iter_mut() {
@@ -364,6 +479,151 @@ fn read_cmdline(pid: u32) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn read_has_tty_proc(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid)) else {
+        return false;
+    };
+    let Some(rparen) = stat.rfind(')') else {
+        return false;
+    };
+    let rest = &stat[rparen + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // after comm: state(0) ppid(1) pgrp(2) session(3) tty_nr(4)
+    let Some(tty) = fields.get(4).and_then(|s| s.parse::<i32>().ok()) else {
+        return false;
+    };
+    tty != 0
+}
+
+#[cfg(target_os = "linux")]
+fn read_exe_basename_proc(pid: u32) -> Option<String> {
+    let path = fs::read_link(format!("/proc/{}/exe", pid)).ok()?;
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    Some(name)
+}
+
+#[cfg(target_os = "linux")]
+fn read_user_launched_proc(pid: u32) -> bool {
+    if read_has_tty_proc(pid) {
+        return true;
+    }
+    read_exe_basename_proc(pid)
+        .as_deref()
+        .map(is_interpreter_exe)
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn enrich_process_info(entries: &mut [Entry]) {
+    for e in entries.iter_mut() {
+        if e.pid.is_none() {
+            e.cwd = "-".to_string();
+            e.cmdline = "-".to_string();
+        }
+    }
+
+    let unique_pids: HashSet<u32> = entries.iter().filter_map(|e| e.pid).collect();
+    if unique_pids.is_empty() {
+        return;
+    }
+    let pid_list = unique_pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // ps pass 1: tty + comm (exe path) per pid.
+    // BSD ps uses "??" to mean "no controlling tty".
+    let mut tty_exe: HashMap<u32, (bool, String)> = HashMap::new();
+    if let Ok(output) = Command::new("ps")
+        .args(["-ww", "-o", "pid=,tty=,comm=", "-p", &pid_list])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&output.stdout);
+        for line in s.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 3 {
+                continue;
+            }
+            let Ok(pid) = parts[0].parse::<u32>() else {
+                continue;
+            };
+            let tty = parts[1];
+            let has_tty = tty != "??" && tty != "?" && tty != "-";
+            // comm may contain spaces (paths with spaces); join the remainder.
+            let comm = parts[2..].join(" ");
+            let basename = comm.rsplit('/').next().unwrap_or(&comm).to_string();
+            tty_exe.insert(pid, (has_tty, basename));
+        }
+    }
+
+    // ps pass 2: full command line per pid.
+    let mut cmdline_map: HashMap<u32, String> = HashMap::new();
+    if let Ok(output) = Command::new("ps")
+        .args(["-ww", "-o", "pid=,command=", "-p", &pid_list])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&output.stdout);
+        for line in s.lines() {
+            let trimmed = line.trim_start();
+            let Some(sp) = trimmed.find(char::is_whitespace) else {
+                continue;
+            };
+            let (pid_s, rest) = trimmed.split_at(sp);
+            let Ok(pid) = pid_s.parse::<u32>() else {
+                continue;
+            };
+            let cmd = rest.trim();
+            let value = if cmd.is_empty() { "-".to_string() } else { cmd.to_string() };
+            cmdline_map.insert(pid, value);
+        }
+    }
+
+    // lsof pass: cwd per pid, batched.
+    let mut cwd_map: HashMap<u32, String> = HashMap::new();
+    if let Ok(output) = Command::new("lsof")
+        .args(["-a", "-p", &pid_list, "-d", "cwd", "-Fn"])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&output.stdout);
+        let mut cur_pid: Option<u32> = None;
+        for line in s.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let (tag, val) = line.split_at(1);
+            match tag {
+                "p" => cur_pid = val.parse().ok(),
+                "n" => {
+                    if let Some(pid) = cur_pid {
+                        cwd_map.entry(pid).or_insert_with(|| val.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for e in entries.iter_mut() {
+        if let Some(pid) = e.pid {
+            e.cwd = cwd_map.get(&pid).cloned().unwrap_or_else(|| "?".to_string());
+            e.cmdline = cmdline_map
+                .get(&pid)
+                .cloned()
+                .unwrap_or_else(|| "?".to_string());
+            e.user_launched = tty_exe
+                .get(&pid)
+                .map(|(has_tty, exe)| *has_tty || is_interpreter_exe(exe))
+                .unwrap_or(false);
+        }
+    }
+}
+
+// ================================================================
+// Stats enrichment (ps; cross-platform with cfg-gated format)
+// ================================================================
+
 fn enrich_local_stats(entries: &mut [Entry]) {
     let pids: Vec<u32> = entries
         .iter()
@@ -378,10 +638,14 @@ fn enrich_local_stats(entries: &mut [Entry]) {
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let output = match Command::new("ps")
-        .args(["-o", "pid=,pcpu=,rss=,nlwp=,etime=,user=", "-p", &pid_arg])
-        .output()
-    {
+
+    // BSD ps on macOS does not have `nlwp` (thread count); skip that column.
+    let fmt = if cfg!(target_os = "macos") {
+        "pid=,pcpu=,rss=,etime=,user="
+    } else {
+        "pid=,pcpu=,rss=,nlwp=,etime=,user="
+    };
+    let output = match Command::new("ps").args(["-o", fmt, "-p", &pid_arg]).output() {
         Ok(o) => o,
         _ => return,
     };
@@ -389,7 +653,8 @@ fn enrich_local_stats(entries: &mut [Entry]) {
     let mut map: HashMap<u32, Stats> = HashMap::new();
     for line in stdout.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 6 {
+        let min_len = if cfg!(target_os = "macos") { 5 } else { 6 };
+        if parts.len() < min_len {
             continue;
         }
         let Ok(pid) = parts[0].parse::<u32>() else {
@@ -398,9 +663,13 @@ fn enrich_local_stats(entries: &mut [Entry]) {
         let cpu = format!("{}%", parts[1]);
         let rss_kb: u64 = parts[2].parse().unwrap_or(0);
         let mem = format_mem(rss_kb * 1024);
-        let threads = parts[3].parse::<u32>().ok();
-        let uptime = format_etime(parts[4]);
-        let user = Some(parts[5].to_string());
+        let (threads, etime_idx, user_idx) = if cfg!(target_os = "macos") {
+            (None::<u32>, 3usize, 4usize)
+        } else {
+            (parts[3].parse::<u32>().ok(), 4usize, 5usize)
+        };
+        let uptime = format_etime(parts[etime_idx]);
+        let user = Some(parts[user_idx].to_string());
         map.insert(
             pid,
             Stats {
