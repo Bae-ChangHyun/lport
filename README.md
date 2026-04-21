@@ -76,22 +76,28 @@ $ lport info 8080 2222
 
 On **Linux**:
 
-- `ss -tlnpH` / `ss -ulnpH` for listening sockets
-- `/proc/<pid>/cwd` and `/proc/<pid>/cmdline` for process details
-- `ps -o pid=,pcpu=,rss=,nlwp=,etime=,user=` (one batched call) for stats
+- `ss -tlnpH` and `ss -ulnpH` for TCP/UDP listening sockets
+- `/proc/<pid>/{cwd,cmdline,stat,exe}` read directly — no extra process spawn
+- `ps -o pid=,pcpu=,rss=,nlwp=,etime=,user=` (one batched call) for CPU / MEM / uptime / user
 
 On **macOS**:
 
-- `lsof -nP -iTCP -sTCP:LISTEN` / `-iUDP` for listening sockets
-- `lsof -p <pids> -d cwd` (one batched call) for each process's working directory
-- `ps -o pid=,tty=,comm=,command=,pcpu=,rss=,etime=,user=` (batched) for process details and stats
+- `lsof -nP -iTCP -sTCP:LISTEN` and `lsof -nP -iUDP` for TCP/UDP listening sockets
+- `lsof -a -p <pids> -d cwd` (one batched call) for each process's working directory
+- `ps -o pid=,tty=,comm=` (pass 1) for TTY + executable basename
+- `ps -o pid=,command=` (pass 2) for the full command line
+- `ps -o pid=,pcpu=,rss=,etime=,user=` for CPU / MEM / uptime / user
+
+BSD `ps` on macOS has no `nlwp` (thread count), so the `THREADS` row is Linux-only.
 
 And on both:
 
-- `docker ps` for container/image/compose-project mapping
+- `docker ps` for container/image/compose-project mapping, keyed by `(proto, host-port)` so TCP and UDP on the same port stay distinct
 - `docker stats --no-stream <name>` (only in `info` mode) for container CPU / MEM
 
-Dashboard runs in ~130 ms on Linux. macOS is slightly slower because it shells out to `lsof` / `ps` instead of reading `/proc`. The `info` subcommand adds ~1 s only when a Docker container is involved.
+Dashboard runs in ~130 ms on Linux. macOS is slightly slower because it shells out to `lsof` / `ps` instead of reading `/proc`. The `info` subcommand filters to the requested port(s) before enriching, so single-port queries do not pay the whole-system cost; Docker adds ~1 s when a container is involved.
+
+The `JOB` column shows the full working directory (with `$HOME` abbreviated as `~`) and is never truncated — losing the path would defeat the feature.
 
 ## Requirements
 

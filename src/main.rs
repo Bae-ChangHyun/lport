@@ -71,16 +71,17 @@ fn main() {
     });
     entries.dedup_by(|a, b| a.port == b.port && a.proto == b.proto && a.pid == b.pid);
 
+    // Info mode is a single-port query, so filter before the per-PID enrich
+    // step. Otherwise `lport info 8080` pays the cost of reading /proc (or
+    // calling ps/lsof) for every listener on the box.
+    if let Mode::Info { ports } = &mode {
+        entries.retain(|e| ports.contains(&e.port));
+    }
+
     enrich_process_info(&mut entries);
 
-    match &mode {
-        Mode::Info { ports } => {
-            entries.retain(|e| ports.contains(&e.port));
-        }
-        Mode::Dashboard { dev: false } => {
-            entries.retain(|e| e.docker.is_some() || e.user_launched);
-        }
-        Mode::Dashboard { dev: true } => {}
+    if let Mode::Dashboard { dev: false } = &mode {
+        entries.retain(|e| e.docker.is_some() || e.user_launched);
     }
 
     entries.sort_by(|a, b| {
@@ -111,15 +112,29 @@ fn print_help() {
     println!("                   example: lport info 8080 5432");
     println!("  -V, --version    Print version and exit");
     println!("  -h, --help       Print this help and exit");
+    println!();
+    println!("Permissions:");
+    println!("  Processes owned by other users require elevated privileges to inspect:");
+    println!("    Linux:  PID/PROCESS appear as '?' without sudo.");
+    println!("    macOS:  other users' listeners are hidden entirely without sudo.");
+    println!("  Run with `sudo lport` for full visibility across users.");
 }
 
 fn parse_mode(args: &[String]) -> Mode {
     if let Some(idx) = args.iter().position(|a| a == "info") {
+        // Nothing else belongs before `info`; it is its own subcommand.
+        if let Some(unknown) = args[..idx].first() {
+            eprintln!("error: unknown argument '{}'", unknown);
+            std::process::exit(2);
+        }
         let mut ports: Vec<u32> = Vec::new();
         for a in &args[idx + 1..] {
             match a.parse::<u32>() {
                 Ok(p) if p > 0 => ports.push(p),
-                _ => eprintln!("warning: '{}' is not a valid port number, ignored", a),
+                _ => {
+                    eprintln!("error: invalid port '{}'", a);
+                    std::process::exit(2);
+                }
             }
         }
         if ports.is_empty() {
@@ -128,7 +143,17 @@ fn parse_mode(args: &[String]) -> Mode {
         }
         return Mode::Info { ports };
     }
-    let dev = args.iter().any(|a| a == "--dev");
+
+    let mut dev = false;
+    for a in args {
+        match a.as_str() {
+            "--dev" => dev = true,
+            _ => {
+                eprintln!("error: unknown argument '{}'", a);
+                std::process::exit(2);
+            }
+        }
+    }
     Mode::Dashboard { dev }
 }
 
@@ -162,8 +187,10 @@ fn is_interpreter_exe(name: &str) -> bool {
     )
 }
 
-fn load_docker_ports() -> HashMap<u32, DockerInfo> {
-    let mut map: HashMap<u32, DockerInfo> = HashMap::new();
+type DockerMap = HashMap<(&'static str, u32), DockerInfo>;
+
+fn load_docker_ports() -> DockerMap {
+    let mut map: DockerMap = HashMap::new();
     let output = match Command::new("docker")
         .args([
             "ps",
@@ -192,7 +219,14 @@ fn load_docker_ports() -> HashMap<u32, DockerInfo> {
             let Some(arrow) = seg.find("->") else { continue };
             let left = &seg[..arrow];
             let right = &seg[arrow + 2..];
-            let cport_str = right.split('/').next().unwrap_or("");
+            // right looks like "80/tcp" or "80-82/udp"
+            let mut right_parts = right.split('/');
+            let cport_str = right_parts.next().unwrap_or("");
+            let proto: &'static str = match right_parts.next().unwrap_or("") {
+                "tcp" => "tcp",
+                "udp" => "udp",
+                _ => continue,
+            };
             let Some(colon) = left.rfind(':') else { continue };
             let port_str = &left[colon + 1..];
             let (start, end) = match parse_port_range(port_str) {
@@ -203,7 +237,7 @@ fn load_docker_ports() -> HashMap<u32, DockerInfo> {
             for (i, p) in (start..=end).enumerate() {
                 let cp = cstart + i as u32;
                 map.insert(
-                    p,
+                    (proto, p),
                     DockerInfo {
                         name: name.to_string(),
                         image: image.clone(),
@@ -234,7 +268,7 @@ fn parse_port_range(s: &str) -> Option<(u32, u32)> {
 // ================================================================
 
 #[cfg(target_os = "linux")]
-fn collect_listening(docker_map: &HashMap<u32, DockerInfo>) -> Vec<Entry> {
+fn collect_listening(docker_map: &DockerMap) -> Vec<Entry> {
     let mut entries = Vec::new();
     collect_ss("tcp", &["-tlnpH"], docker_map, &mut entries);
     collect_ss("udp", &["-ulnpH"], docker_map, &mut entries);
@@ -245,7 +279,7 @@ fn collect_listening(docker_map: &HashMap<u32, DockerInfo>) -> Vec<Entry> {
 fn collect_ss(
     proto: &'static str,
     args: &[&str],
-    docker_map: &HashMap<u32, DockerInfo>,
+    docker_map: &DockerMap,
     out: &mut Vec<Entry>,
 ) {
     let output = match Command::new("ss").args(args).output() {
@@ -257,9 +291,7 @@ fn collect_ss(
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
-        if let Some(e) = parse_ss_line(line, proto, docker_map) {
-            out.push(e);
-        }
+        parse_ss_line(line, proto, docker_map, out);
     }
 }
 
@@ -267,64 +299,115 @@ fn collect_ss(
 fn parse_ss_line(
     line: &str,
     proto: &'static str,
-    docker_map: &HashMap<u32, DockerInfo>,
-) -> Option<Entry> {
+    docker_map: &DockerMap,
+    out: &mut Vec<Entry>,
+) {
     let fields: Vec<&str> = line.split_whitespace().collect();
     if fields.len() < 4 {
-        return None;
+        return;
     }
     let local = fields[3];
-    let port_str = local.rsplit(':').next()?.trim_end_matches(']');
-    let port: u32 = port_str.parse().ok().filter(|&p| p > 0)?;
-
-    let users_field = fields.iter().find(|f| f.starts_with("users:"));
-    let (process, pid) = match users_field {
-        Some(s) => parse_users(s),
-        None => ("?".to_string(), None),
+    let Some(port_str) = local.rsplit(':').next() else {
+        return;
+    };
+    let port_str = port_str.trim_end_matches(']');
+    let Some(port) = port_str.parse::<u32>().ok().filter(|&p| p > 0) else {
+        return;
     };
 
-    let docker = docker_map.get(&port).cloned();
+    let docker = docker_map.get(&(proto, port)).cloned();
 
-    Some(Entry {
-        proto,
-        port,
-        pid,
-        process,
-        cwd: String::new(),
-        cmdline: String::new(),
-        docker,
-        stats: Stats::default(),
-        user_launched: false,
-    })
+    let users_field = fields.iter().find(|f| f.starts_with("users:"));
+    let pairs = match users_field {
+        Some(s) => parse_users(s),
+        None => Vec::new(),
+    };
+
+    if pairs.is_empty() {
+        out.push(Entry {
+            proto,
+            port,
+            pid: None,
+            process: "?".to_string(),
+            cwd: String::new(),
+            cmdline: String::new(),
+            docker,
+            stats: Stats::default(),
+            user_launched: false,
+        });
+        return;
+    }
+
+    for (name, pid) in pairs {
+        out.push(Entry {
+            proto,
+            port,
+            pid: Some(pid),
+            process: name,
+            cwd: String::new(),
+            cmdline: String::new(),
+            docker: docker.clone(),
+            stats: Stats::default(),
+            user_launched: false,
+        });
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn parse_users(s: &str) -> (String, Option<u32>) {
-    let name = extract_between(s, '"', '"').unwrap_or_else(|| "?".to_string());
-    let pid = extract_pid(s);
-    (name, pid)
-}
-
-#[cfg(target_os = "linux")]
-fn extract_between(s: &str, open: char, close: char) -> Option<String> {
-    let start = s.find(open)? + 1;
-    let rest = &s[start..];
-    let end = rest.find(close)?;
-    Some(rest[..end].to_string())
-}
-
-#[cfg(target_os = "linux")]
-fn extract_pid(s: &str) -> Option<u32> {
-    let idx = s.find("pid=")? + 4;
-    let rest = &s[idx..];
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    rest[..end].parse().ok()
+fn parse_users(s: &str) -> Vec<(String, u32)> {
+    // users field looks like: users:(("name1",pid=123,fd=10),("name2",pid=456,fd=11))
+    // Walk the string, matching each ("<name>",pid=<N>) pair.
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // find opening quote
+        while i < bytes.len() && bytes[i] != b'"' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let name_start = i + 1;
+        i = name_start;
+        while i < bytes.len() && bytes[i] != b'"' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let name = &s[name_start..i];
+        i += 1; // past closing quote
+        // find pid= before the next '"' or end
+        let mut scan = i;
+        let mut found_pid: Option<u32> = None;
+        while scan < bytes.len() && bytes[scan] != b'"' {
+            if bytes[scan..].starts_with(b"pid=") {
+                let digits_start = scan + 4;
+                let mut digits_end = digits_start;
+                while digits_end < bytes.len() && bytes[digits_end].is_ascii_digit() {
+                    digits_end += 1;
+                }
+                if digits_end > digits_start {
+                    if let Ok(pid) = s[digits_start..digits_end].parse::<u32>() {
+                        found_pid = Some(pid);
+                    }
+                }
+                break;
+            }
+            scan += 1;
+        }
+        if let Some(pid) = found_pid {
+            out.push((name.to_string(), pid));
+        }
+        // advance to next candidate: jump to the char after the next '"' (end of this entry)
+        i = scan;
+    }
+    out
 }
 
 #[cfg(target_os = "macos")]
-fn collect_listening(docker_map: &HashMap<u32, DockerInfo>) -> Vec<Entry> {
+fn collect_listening(docker_map: &DockerMap) -> Vec<Entry> {
     let mut entries = Vec::new();
     collect_lsof(
         "tcp",
@@ -340,7 +423,7 @@ fn collect_listening(docker_map: &HashMap<u32, DockerInfo>) -> Vec<Entry> {
 fn collect_lsof(
     proto: &'static str,
     args: &[&str],
-    docker_map: &HashMap<u32, DockerInfo>,
+    docker_map: &DockerMap,
     out: &mut Vec<Entry>,
 ) {
     let output = match Command::new("lsof").args(args).output() {
@@ -400,12 +483,18 @@ fn flush_lsof(
     pid: Option<u32>,
     cmd: &str,
     name: &Option<String>,
-    docker_map: &HashMap<u32, DockerInfo>,
+    docker_map: &DockerMap,
     out: &mut Vec<Entry>,
 ) {
     let Some(name) = name else { return };
     // Strip trailing " (LISTEN)" or similar parenthetical suffixes
     let name_first = name.split_whitespace().next().unwrap_or(name);
+    // A connected socket looks like "local:port->remote:port"; that is not a
+    // listener. `lsof -iUDP` (which has no LISTEN filter) can surface those,
+    // and their trailing segment would be parsed as a local port otherwise.
+    if name_first.contains("->") {
+        return;
+    }
     // For UDP with an idle state (e.g. "*:5353" or "*:5353 (IDLE)") we still want the addr part.
     let Some(port_str) = name_first.rsplit(':').next() else {
         return;
@@ -417,7 +506,7 @@ fn flush_lsof(
     if port == 0 {
         return;
     }
-    let docker = docker_map.get(&port).cloned();
+    let docker = docker_map.get(&(proto, port)).cloned();
     out.push(Entry {
         proto,
         port,
@@ -438,15 +527,34 @@ fn flush_lsof(
 #[cfg(target_os = "linux")]
 fn enrich_process_info(entries: &mut [Entry]) {
     for e in entries.iter_mut() {
-        match e.pid {
-            Some(pid) => {
-                e.cwd = read_cwd_proc(pid);
-                e.cmdline = read_cmdline_proc(pid);
-                e.user_launched = read_user_launched_proc(pid);
-            }
-            None => {
-                e.cwd = "-".to_string();
-                e.cmdline = "-".to_string();
+        if e.pid.is_none() {
+            e.cwd = "-".to_string();
+            e.cmdline = "-".to_string();
+        }
+    }
+
+    let unique_pids: HashSet<u32> = entries.iter().filter_map(|e| e.pid).collect();
+    if unique_pids.is_empty() {
+        return;
+    }
+
+    // Read /proc entries once per PID. A single PID can listen on many ports
+    // (a reverse proxy, for example), and the previous implementation paid
+    // those syscalls per-entry.
+    let mut info: HashMap<u32, (String, String, bool)> = HashMap::with_capacity(unique_pids.len());
+    for pid in &unique_pids {
+        let cwd = read_cwd_proc(*pid);
+        let cmdline = read_cmdline_proc(*pid);
+        let user_launched = read_user_launched_proc(*pid);
+        info.insert(*pid, (cwd, cmdline, user_launched));
+    }
+
+    for e in entries.iter_mut() {
+        if let Some(pid) = e.pid {
+            if let Some((cwd, cmdline, user_launched)) = info.get(&pid) {
+                e.cwd = cwd.clone();
+                e.cmdline = cmdline.clone();
+                e.user_launched = *user_launched;
             }
         }
     }
@@ -802,38 +910,23 @@ fn nz(s: &str) -> String {
     }
 }
 
-fn shorten_path(s: &str, max: usize, home: Option<&str>) -> String {
+fn shorten_path(s: &str, home: Option<&str>) -> String {
+    // Truncation is intentionally absent: the CWD is the feature, clipping it
+    // to `…` would defeat the point. Only the `$HOME -> ~` substitution is
+    // applied here for readability; columns expand to whatever width is needed.
     if matches!(s, "" | "-" | "?" | "/") {
         return s.to_string();
     }
-    let mut path = s.to_string();
     if let Some(h) = home {
-        if path == h {
+        if s == h {
             return "~".to_string();
         }
         let prefix = format!("{}/", h);
-        if let Some(rest) = path.strip_prefix(&prefix) {
-            path = format!("~/{}", rest);
+        if let Some(rest) = s.strip_prefix(&prefix) {
+            return format!("~/{}", rest);
         }
     }
-    if path.chars().count() <= max {
-        return path;
-    }
-    let parts: Vec<&str> = path.split('/').collect();
-    for start in 1..parts.len() {
-        let candidate = format!("…/{}", parts[start..].join("/"));
-        if candidate.chars().count() <= max {
-            return candidate;
-        }
-    }
-    let last = parts.last().copied().unwrap_or("");
-    let cs: Vec<char> = last.chars().collect();
-    if cs.len() > max && max > 1 {
-        let kept: String = cs[cs.len() - (max - 1)..].iter().collect();
-        format!("…{}", kept)
-    } else {
-        last.to_string()
-    }
+    s.to_string()
 }
 
 fn print_info(entries: &[Entry]) {
@@ -909,14 +1002,13 @@ fn print_table(entries: &[Entry], dev_mode: bool) {
     ];
 
     let home = std::env::var("HOME").ok();
-    let job_max = 50usize;
 
     let rows: Vec<Vec<String>> = entries
         .iter()
         .map(|e| {
             let (process, job) = match &e.docker {
                 Some(d) => ("docker".to_string(), d.name.clone()),
-                None => (e.process.clone(), shorten_path(&e.cwd, job_max, home.as_deref())),
+                None => (e.process.clone(), shorten_path(&e.cwd, home.as_deref())),
             };
             vec![
                 e.proto.to_string(),
