@@ -1,6 +1,6 @@
 [package]
 name = "lport"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "List listening ports with the folder each server was launched from."
 license = "MIT"
