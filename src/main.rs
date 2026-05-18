@@ -48,6 +48,7 @@ struct Entry {
 enum Mode {
     Dashboard { dev: bool },
     Info { ports: Vec<u32> },
+    Kill { ports: Vec<u32>, force: bool },
 }
 
 fn main() {
@@ -71,14 +72,21 @@ fn main() {
     });
     entries.dedup_by(|a, b| a.port == b.port && a.proto == b.proto && a.pid == b.pid);
 
-    // Info mode is a single-port query, so filter before the per-PID enrich
-    // step. Otherwise `lport info 8080` pays the cost of reading /proc (or
-    // calling ps/lsof) for every listener on the box.
-    if let Mode::Info { ports } = &mode {
-        entries.retain(|e| ports.contains(&e.port));
+    // Info / Kill modes are single-port queries, so filter before the per-PID
+    // enrich step. Otherwise `lport info 8080` pays the cost of reading /proc
+    // (or calling ps/lsof) for every listener on the box.
+    match &mode {
+        Mode::Info { ports } | Mode::Kill { ports, .. } => {
+            entries.retain(|e| ports.contains(&e.port));
+        }
+        _ => {}
     }
 
     enrich_process_info(&mut entries);
+
+    if let Mode::Kill { ports, force } = &mode {
+        std::process::exit(run_kill(&entries, ports, *force));
+    }
 
     if let Mode::Dashboard { dev: false } = &mode {
         entries.retain(|e| e.docker.is_some() || e.user_launched);
@@ -97,12 +105,16 @@ fn main() {
     match mode {
         Mode::Info { .. } => print_info(&entries),
         Mode::Dashboard { dev } => print_table(&entries, dev),
+        // Kill mode already exited via `run_kill` above; this arm exists only
+        // to satisfy exhaustiveness.
+        Mode::Kill { .. } => unreachable!(),
     }
 }
 
 fn print_help() {
     println!("Usage: lport [--dev]");
     println!("       lport info PORT [PORT ...]");
+    println!("       lport kill PORT [PORT ...] [-9|--force]");
     println!();
     println!("  (default)        Show user-launched servers and Docker containers only");
     println!("                   (PROTO PORT PID PROCESS JOB CPU MEM UPTIME)");
@@ -110,14 +122,114 @@ fn print_help() {
     println!("  info PORT...     Show full details for the given port(s),");
     println!("                   including Docker container CPU/MEM");
     println!("                   example: lport info 8080 5432");
+    println!("  kill PORT...     Terminate the process(es) listening on the given port(s).");
+    println!("                   Sends SIGTERM by default; pass -9 / --force for SIGKILL.");
+    println!("                   Docker-backed ports are not killed; lport prints the");
+    println!("                   matching `docker stop` command instead.");
+    println!("                   example: lport kill 3000 8080");
     println!("  -V, --version    Print version and exit");
     println!("  -h, --help       Print this help and exit");
     println!();
     println!("Permissions:");
-    println!("  Processes owned by other users require elevated privileges to inspect:");
+    println!("  Processes owned by other users require elevated privileges to inspect");
+    println!("  or kill:");
     println!("    Linux:  PID/PROCESS appear as '?' without sudo.");
     println!("    macOS:  other users' listeners are hidden entirely without sudo.");
     println!("  Run with `sudo lport` for full visibility across users.");
+}
+
+fn run_kill(entries: &[Entry], ports: &[u32], force: bool) -> i32 {
+    let signal_flag = if force { "-KILL" } else { "-TERM" };
+    let signal_name = if force { "SIGKILL" } else { "SIGTERM" };
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    let mut out = stdout.lock();
+    let mut err = stderr.lock();
+    let mut any_error = false;
+    // Dedup across ports: a single PID listening on tcp+udp or on multiple
+    // ports given on one command line should only receive one signal.
+    let mut signaled: HashSet<u32> = HashSet::new();
+
+    for &port in ports {
+        let matches: Vec<&Entry> = entries.iter().filter(|e| e.port == port).collect();
+        if matches.is_empty() {
+            outln!(err, "port {}: no listening process found.", port);
+            any_error = true;
+            continue;
+        }
+
+        for entry in &matches {
+            if let Some(d) = &entry.docker {
+                outln!(
+                    err,
+                    "port {}/{}: owned by Docker container '{}'. Use: docker stop {}",
+                    entry.proto,
+                    port,
+                    d.name,
+                    d.name
+                );
+                any_error = true;
+                continue;
+            }
+            let Some(pid) = entry.pid else {
+                outln!(
+                    err,
+                    "port {}/{}: PID unknown (insufficient privileges?). Try `sudo lport kill {}`.",
+                    entry.proto,
+                    port,
+                    port
+                );
+                any_error = true;
+                continue;
+            };
+            if !signaled.insert(pid) {
+                continue;
+            }
+            let status = Command::new("kill")
+                .args([signal_flag, &pid.to_string()])
+                .status();
+            match status {
+                Ok(s) if s.success() => {
+                    outln!(
+                        out,
+                        "killed pid {} ({}) on {}/{} [{}]",
+                        pid,
+                        entry.process,
+                        entry.proto,
+                        port,
+                        signal_name
+                    );
+                }
+                Ok(s) => {
+                    outln!(
+                        err,
+                        "port {}/{}: `kill {} {}` exited with status {}.",
+                        entry.proto,
+                        port,
+                        signal_flag,
+                        pid,
+                        s.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into())
+                    );
+                    any_error = true;
+                }
+                Err(spawn_err) => {
+                    outln!(
+                        err,
+                        "port {}/{}: failed to spawn `kill`: {}.",
+                        entry.proto,
+                        port,
+                        spawn_err
+                    );
+                    any_error = true;
+                }
+            }
+        }
+    }
+    if any_error {
+        1
+    } else {
+        0
+    }
 }
 
 fn parse_mode(args: &[String]) -> Mode {
@@ -142,6 +254,32 @@ fn parse_mode(args: &[String]) -> Mode {
             std::process::exit(2);
         }
         return Mode::Info { ports };
+    }
+
+    if let Some(idx) = args.iter().position(|a| a == "kill") {
+        if let Some(unknown) = args[..idx].first() {
+            eprintln!("error: unknown argument '{}'", unknown);
+            std::process::exit(2);
+        }
+        let mut ports: Vec<u32> = Vec::new();
+        let mut force = false;
+        for a in &args[idx + 1..] {
+            match a.as_str() {
+                "-9" | "--force" => force = true,
+                _ => match a.parse::<u32>() {
+                    Ok(p) if p > 0 => ports.push(p),
+                    _ => {
+                        eprintln!("error: invalid port '{}'", a);
+                        std::process::exit(2);
+                    }
+                },
+            }
+        }
+        if ports.is_empty() {
+            eprintln!("error: 'lport kill' requires at least one port number.");
+            std::process::exit(2);
+        }
+        return Mode::Kill { ports, force };
     }
 
     let mut dev = false;
