@@ -317,7 +317,11 @@ fn parse_ss_line(
 
     let docker = docker_map.get(&(proto, port)).cloned();
 
-    let users_field = fields.iter().find(|f| f.starts_with("users:"));
+    // `users:(...)` is the trailing column. Locate it in the raw line instead
+    // of in whitespace-split tokens, because the process name inside the
+    // parens can itself contain spaces (e.g. comm `next-server (v1`), which
+    // would otherwise tear the token apart and hide the PID.
+    let users_field = line.find("users:").map(|i| &line[i..]);
     let pairs = match users_field {
         Some(s) => parse_users(s),
         None => Vec::new(),
