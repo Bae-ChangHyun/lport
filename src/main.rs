@@ -31,6 +31,10 @@ struct DockerInfo {
     running_for: String,
     work_dir: Option<String>,
     container_port: u32,
+    // `com.docker.compose.project` label. Used to group sibling containers of
+    // the same compose project (e.g. all `supabase_*_helchang` rows) under one
+    // visual block.
+    compose_project: Option<String>,
 }
 
 struct Entry {
@@ -92,10 +96,15 @@ fn main() {
         entries.retain(|e| e.docker.is_some() || e.user_launched);
     }
 
+    // Sort by visual group key (compose project if present, else container
+    // name for docker, else cwd for local), then container name for
+    // determinism within a group, then port/proto.
     entries.sort_by(|a, b| {
-        let ka = a.docker.as_ref().map(|d| d.name.as_str()).unwrap_or(a.cwd.as_str());
-        let kb = b.docker.as_ref().map(|d| d.name.as_str()).unwrap_or(b.cwd.as_str());
-        (ka, a.port, a.proto).cmp(&(kb, b.port, b.proto))
+        let group_a = group_key(a);
+        let group_b = group_key(b);
+        let name_a = a.docker.as_ref().map(|d| d.name.as_str()).unwrap_or("");
+        let name_b = b.docker.as_ref().map(|d| d.name.as_str()).unwrap_or("");
+        (group_a, name_a, a.port, a.proto).cmp(&(group_b, name_b, b.port, b.proto))
     });
 
     enrich_local_stats(&mut entries);
@@ -333,7 +342,7 @@ fn load_docker_ports() -> DockerMap {
         .args([
             "ps",
             "--format",
-            "{{.Names}}\t{{.Ports}}\t{{.Label \"com.docker.compose.project.working_dir\"}}\t{{.Image}}\t{{.RunningFor}}",
+            "{{.Names}}\t{{.Ports}}\t{{.Label \"com.docker.compose.project.working_dir\"}}\t{{.Image}}\t{{.RunningFor}}\t{{.Label \"com.docker.compose.project\"}}",
         ])
         .output()
     {
@@ -342,7 +351,7 @@ fn load_docker_ports() -> DockerMap {
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
-        let mut parts = line.splitn(5, '\t');
+        let mut parts = line.splitn(6, '\t');
         let Some(name) = parts.next() else { continue };
         let Some(ports) = parts.next() else { continue };
         let work_dir = parts
@@ -352,6 +361,11 @@ fn load_docker_ports() -> DockerMap {
             .map(str::to_string);
         let image = parts.next().unwrap_or("-").to_string();
         let running_for = parts.next().unwrap_or("-").to_string();
+        let compose_project = parts
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         for segment in ports.split(',') {
             let seg = segment.trim();
             let Some(arrow) = seg.find("->") else { continue };
@@ -382,6 +396,7 @@ fn load_docker_ports() -> DockerMap {
                         running_for: running_for.clone(),
                         work_dir: work_dir.clone(),
                         container_port: cp,
+                        compose_project: compose_project.clone(),
                     },
                 );
             }
@@ -1044,6 +1059,17 @@ fn format_etime(et: &str) -> String {
     }
 }
 
+// Visual group key: compose project for docker rows in the same project,
+// container name when no compose label, cwd for local rows. Two entries with
+// the same key sit in the same visual block in the table.
+fn group_key(e: &Entry) -> &str {
+    if let Some(d) = &e.docker {
+        d.compose_project.as_deref().unwrap_or(d.name.as_str())
+    } else {
+        e.cwd.as_str()
+    }
+}
+
 fn nz(s: &str) -> String {
     if s.is_empty() {
         "-".to_string()
@@ -1186,8 +1212,28 @@ fn print_table(entries: &[Entry], dev_mode: bool) {
     outln!(out, "{}", fmt_row(&header_cells));
     let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
     outln!(out, "{}", sep.join("  "));
-    for row in &rows {
+    // Every docker block (whether the group has one row or many) gets the
+    // same `[ name ]` header treatment, preceded by a blank line so it reads
+    // as a distinct block from neighbouring rows. Group key is the compose
+    // project label if present, else the container name. Local rows stay
+    // compact and are never given a separator among themselves.
+    let mut prev_docker_group: Option<&str> = None;
+    for (i, (e, row)) in entries.iter().zip(rows.iter()).enumerate() {
+        let cur_docker_group: Option<&str> = if e.docker.is_some() {
+            Some(group_key(e))
+        } else {
+            None
+        };
+        if cur_docker_group.is_some() && cur_docker_group != prev_docker_group {
+            if i > 0 {
+                outln!(out, "");
+            }
+            if let Some(name) = cur_docker_group {
+                outln!(out, "[ {} ]", name);
+            }
+        }
         outln!(out, "{}", fmt_row(row));
+        prev_docker_group = cur_docker_group;
     }
 
     if entries.is_empty() {
