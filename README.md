@@ -3,13 +3,19 @@
 > List listening ports on Linux and macOS — and **which folder each server was launched from**.
 
 ```
-PROTO  PORT  PID      PROCESS  JOB                                     CPU   MEM   UPTIME
------  ----  -------  -------  --------------------------------------  ----  ----  ------
-tcp    3000  3478594  python3  /home/bch/Project/scriptable            0.0%  20M   7d19h
-tcp    5174  1644291  node     /home/bch/Project/doc-portfolio/editor  0.0%  93M   14d19h
-tcp    8080  3571557  python3  /home/bch/obsidian_new/wiki-web         0.0%  62M   22h19m
-tcp    1200  -        docker   rsshub-rsshub-1                         -     -     7 weeks
-tcp    2222  -        docker   unsloth                                 -     -     4 weeks
+PROTO  PORT  PID      PROCESS  JOB                                CPU   MEM   UPTIME
+-----  ----  -------  -------  ---------------------------------  ----  ----  -------
+tcp    3000  3478594  python3  ~/Project/scriptable               0.0%  20M   7d19h
+tcp    5174  1644291  node     ~/Project/doc-portfolio/editor     0.0%  93M   14d19h
+tcp    8080  3571557  python3  ~/obsidian_new/wiki-web            0.0%  62M   22h19m
+
+[ rsshub ]
+tcp    1200  -        docker   rsshub-rsshub-1                    -     -     7 weeks
+
+[ supabase-prod ]
+tcp    5432  -        docker   supabase_db_supabase-prod          -     -     2 days
+tcp    8000  -        docker   supabase_kong_supabase-prod        -     -     2 days
+tcp    8443  -        docker   supabase_studio_supabase-prod      -     -     2 days
 ```
 
 ## About
@@ -42,8 +48,28 @@ lport                    # dashboard: user servers + docker containers
 lport --dev              # everything (system daemons included)
 lport info 8080          # detail block for a single port
 lport info 8080 5432     # multiple ports
+lport kill 3000          # SIGTERM the process(es) listening on port 3000
+lport kill -9 3000 8080  # SIGKILL multiple ports
 sudo lport               # full visibility into other users' processes
 ```
+
+Docker containers are grouped by their `com.docker.compose.project`
+label (falling back to the container name), so sibling containers of
+the same compose project read as one `[ project ]` block in the
+dashboard.
+
+### Killing a port
+
+```
+$ lport kill 3000
+killed pid 587649 (python3) on tcp/3000 [SIGTERM]
+
+$ lport kill 5432
+port tcp/5432: owned by Docker container 'supabase_db_supabase-prod'. Use: docker stop supabase_db_supabase-prod
+```
+
+Docker-backed ports are not killed; `lport` prints the matching
+`docker stop` command instead. Pass `-9` / `--force` for `SIGKILL`.
 
 ### Detail view
 
