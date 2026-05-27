@@ -1,10 +1,20 @@
-# lport
+<div align="center">
 
-> List listening ports on Linux and macOS — and **which folder each server was launched from**.
+![lport](docs/banner.png)
 
-<p align="center">
-  <img src="demo/dashboard.gif" alt="lport dashboard" width="780"/>
-</p>
+[![Release](https://img.shields.io/github/v/release/Bae-ChangHyun/lport?style=flat-square&color=F5B240)](https://github.com/Bae-ChangHyun/lport/releases)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-blue?style=flat-square)](#requirements)
+[![Built with](https://img.shields.io/badge/Built%20with-Rust-CE422B?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Zero deps](https://img.shields.io/badge/Dependencies-stdlib%20only-444?style=flat-square)](Cargo.toml)
+
+**List listening ports on Linux and macOS — and the folder each server was launched from.**
+
+[Quick start](#quick-start) · [Usage](#usage) · [How it works](#how-it-works) · [Releases](https://github.com/Bae-ChangHyun/lport/releases)
+
+</div>
+
+---
 
 ## About
 
@@ -13,7 +23,13 @@ A tiny (~550 KB, zero-dependency) Rust CLI that answers two questions you actual
 1. *Which port is `8080`?*
 2. *Which folder did I `npm run dev` from to start that thing?*
 
-`lport` shows the **working directory** of each listening server's process — so you instantly know which project a port belongs to. Docker compose containers display their compose project directory.
+`lport` shows the **working directory** of each listening server's process — so you instantly know which project a port belongs to. Docker compose containers are grouped by project, so sibling services (`supabase_db_*`, `supabase_kong_*`, …) read as one block instead of a scattered list.
+
+### Why?
+
+`lsof -i` and `ss -tlnp` tell you which PID owns a port. They don't tell you which project that PID came from — and they treat every Docker container as just another opaque process.
+
+`lport` adds the missing layer: each row carries the cwd (or the compose project working directory), and Docker rows roll up under a `[ project ]` header so a stack reads as one block.
 
 ## Quick start
 
@@ -23,9 +39,14 @@ curl -sfL https://raw.githubusercontent.com/Bae-ChangHyun/lport/main/install.sh 
 
 Requires the Rust toolchain (the script tells you how to install it in one line if missing). Re-running the installer detects the version on disk and skips work when you're already on the latest release; pass `--force` to reinstall anyway.
 
-Or directly:
-
 ```bash
+# fresh install or auto-upgrade
+curl -sfL https://raw.githubusercontent.com/Bae-ChangHyun/lport/main/install.sh | sh
+
+# force reinstall
+curl -sfL https://raw.githubusercontent.com/Bae-ChangHyun/lport/main/install.sh | sh -s -- --force
+
+# or directly via cargo
 cargo install --git https://github.com/Bae-ChangHyun/lport
 ```
 
@@ -41,7 +62,13 @@ lport kill -9 3000 8080  # SIGKILL multiple ports
 sudo lport               # full visibility into other users' processes
 ```
 
-Docker containers are grouped by their `com.docker.compose.project` label (falling back to the container name), so sibling containers of the same compose project read as one `[ project ]` block in the dashboard.
+### Dashboard
+
+<p align="center">
+  <img src="demo/dashboard.gif" alt="lport dashboard" width="780"/>
+</p>
+
+The default view groups Docker containers by their `com.docker.compose.project` label (falling back to the container name), so sibling containers of the same compose project read as one `[ project ]` block. Local rows show the full working directory in the `JOB` column with `$HOME` abbreviated to `~`. The column is **never truncated** — losing the path would defeat the feature.
 
 ### Detail view
 
@@ -104,8 +131,6 @@ And on both:
 - `docker stats --no-stream <name>` (only in `info` mode) for container CPU / MEM
 
 Dashboard runs in ~130 ms on Linux. macOS is slightly slower because it shells out to `lsof` / `ps` instead of reading `/proc`. The `info` and `kill` subcommands filter to the requested port(s) before enriching, so single-port operations do not pay the whole-system cost; Docker adds ~1 s when a container is involved.
-
-The `JOB` column shows the full working directory (with `$HOME` abbreviated as `~`) and is never truncated — losing the path would defeat the feature.
 
 ## Requirements
 
