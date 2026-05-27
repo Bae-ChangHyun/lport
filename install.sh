@@ -4,12 +4,23 @@
 # Usage:
 #   curl -sfL https://raw.githubusercontent.com/Bae-ChangHyun/lport/main/install.sh | sh
 #
+#   # reinstall even if the installed version is already up to date:
+#   curl -sfL .../install.sh | sh -s -- --force
+#
 # This installs lport via `cargo install --git`. Requires the Rust toolchain.
 
 set -e
 
 REPO="https://github.com/Bae-ChangHyun/lport"
+RAW_CARGO_TOML="https://raw.githubusercontent.com/Bae-ChangHyun/lport/main/Cargo.toml"
 BIN="lport"
+
+FORCE=0
+for arg in "$@"; do
+  case "$arg" in
+    --force|-f) FORCE=1 ;;
+  esac
+done
 
 color() { printf '\033[%sm%s\033[0m' "$1" "$2"; }
 info()  { printf '%s %s\n' "$(color '1;34' '==>')" "$1"; }
@@ -49,11 +60,36 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-# 4. Install
-info "Installing $BIN from $REPO ..."
+# 4. Detect existing install + compare with latest upstream version
+INSTALLED_VERSION=""
+if command -v "$BIN" >/dev/null 2>&1; then
+  INSTALLED_VERSION="$("$BIN" -V 2>/dev/null | awk '{print $2}')"
+fi
+
+LATEST_VERSION=""
+if command -v curl >/dev/null 2>&1; then
+  LATEST_VERSION="$(curl -fsSL --max-time 5 "$RAW_CARGO_TOML" 2>/dev/null \
+    | awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}')"
+fi
+
+if [ "$FORCE" = 0 ] && [ -n "$INSTALLED_VERSION" ] && [ -n "$LATEST_VERSION" ] \
+    && [ "$INSTALLED_VERSION" = "$LATEST_VERSION" ]; then
+  info "$BIN $INSTALLED_VERSION is already up to date. Pass --force to reinstall."
+  exit 0
+fi
+
+# 5. Install / update
+if [ -n "$INSTALLED_VERSION" ] && [ -n "$LATEST_VERSION" ] \
+    && [ "$INSTALLED_VERSION" != "$LATEST_VERSION" ]; then
+  info "Updating $BIN: $INSTALLED_VERSION -> $LATEST_VERSION ..."
+elif [ -n "$INSTALLED_VERSION" ]; then
+  info "Reinstalling $BIN $INSTALLED_VERSION from $REPO ..."
+else
+  info "Installing $BIN from $REPO ..."
+fi
 cargo install --git "$REPO" --force
 
-# 5. PATH check
+# 6. PATH check
 CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
 case ":$PATH:" in
   *":$CARGO_BIN:"*) ;;
