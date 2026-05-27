@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -89,7 +91,9 @@ fn main() {
     enrich_process_info(&mut entries);
 
     if let Mode::Kill { ports, force } = &mode {
-        std::process::exit(run_kill(&entries, ports, *force));
+        let code = run_kill(&entries, ports, *force);
+        maybe_print_update_notice();
+        std::process::exit(code);
     }
 
     if let Mode::Dashboard { dev: false } = &mode {
@@ -118,6 +122,8 @@ fn main() {
         // to satisfy exhaustiveness.
         Mode::Kill { .. } => unreachable!(),
     }
+
+    maybe_print_update_notice();
 }
 
 fn print_help() {
@@ -1068,6 +1074,189 @@ fn group_key(e: &Entry) -> &str {
     } else {
         e.cwd.as_str()
     }
+}
+
+// ================================================================
+// Update notice (best-effort, never blocks the dashboard)
+// ================================================================
+//
+// Strategy: cache the latest upstream version under
+// `${XDG_CACHE_HOME:-$HOME/.cache}/lport/update-check`. On every run:
+//   1. Read the cache. If a newer version is recorded, print a one-line
+//      notice to stderr (after the table).
+//   2. If the cache is older than 24h (or missing), spawn a detached `sh`
+//      that re-fetches `Cargo.toml` from main and rewrites the cache. The
+//      result is observable on the *next* run, not this one — so startup
+//      stays fast.
+// `LPORT_NO_UPDATE_CHECK=1` disables both halves.
+
+const UPDATE_CACHE_TTL_SECS: u64 = 24 * 3600;
+const UPDATE_REPO: &str = "https://github.com/Bae-ChangHyun/lport";
+const UPDATE_RAW_CARGO_TOML: &str =
+    "https://raw.githubusercontent.com/Bae-ChangHyun/lport/main/Cargo.toml";
+
+fn maybe_print_update_notice() {
+    if std::env::var_os("LPORT_NO_UPDATE_CHECK").is_some() {
+        return;
+    }
+    let Some(cache_path) = update_cache_path() else {
+        return;
+    };
+    let current = env!("CARGO_PKG_VERSION");
+
+    let cached = std::fs::read_to_string(&cache_path).ok();
+    let mut cache_fresh = false;
+    let mut latest: Option<String> = None;
+    if let Some(s) = cached.as_deref() {
+        let mut lines = s.lines();
+        let ts_line = lines.next().unwrap_or("").trim();
+        let ver_line = lines.next().unwrap_or("").trim();
+        if let (Ok(ts), Some(now)) = (ts_line.parse::<u64>(), unix_now()) {
+            if now >= ts && now - ts < UPDATE_CACHE_TTL_SECS {
+                cache_fresh = true;
+            }
+        }
+        if !ver_line.is_empty() && version_gt(ver_line, current) {
+            latest = Some(ver_line.to_string());
+        }
+    }
+    if let Some(latest) = latest {
+        prompt_or_print_update(current, &latest);
+    }
+    if !cache_fresh {
+        spawn_update_cache_refresh(&cache_path);
+    }
+}
+
+// Show the update notice. If the session is fully interactive (stdin, stdout,
+// stderr all attached to a TTY), also prompt `[y/N]` and run
+// `cargo install --git ... --force` on `y`. Default is N so an unattended
+// Enter does not silently kick off a heavy rebuild.
+fn prompt_or_print_update(current: &str, latest: &str) {
+    let stderr_tty = io::stderr().is_terminal();
+    let interactive =
+        stderr_tty && io::stdout().is_terminal() && io::stdin().is_terminal();
+    let dot = if stderr_tty { "\x1b[33m●\x1b[0m" } else { "*" };
+    let bold = |s: &str| -> String {
+        if stderr_tty {
+            format!("\x1b[1m{}\x1b[0m", s)
+        } else {
+            s.to_string()
+        }
+    };
+
+    if interactive {
+        eprintln!();
+        eprint!(
+            "{}  update available: lport {} → {}   install now? {} ",
+            dot,
+            current,
+            latest,
+            bold("[y/N]"),
+        );
+        let _ = io::stderr().flush();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_ok() {
+            let answer = input.trim();
+            if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
+                run_cargo_install();
+            }
+        }
+    } else {
+        eprintln!();
+        eprintln!(
+            "{}  update available: lport {} → {}",
+            dot, current, latest
+        );
+        eprintln!(
+            "   install: cargo install --git {} --force",
+            UPDATE_REPO
+        );
+    }
+}
+
+fn run_cargo_install() {
+    eprintln!();
+    eprintln!("==> cargo install --git {} --force", UPDATE_REPO);
+    match Command::new("cargo")
+        .args(["install", "--git", UPDATE_REPO, "--force"])
+        .status()
+    {
+        Ok(s) if s.success() => {
+            eprintln!("==> lport updated. Re-run to use the new version.");
+        }
+        Ok(s) => {
+            eprintln!(
+                "==> cargo install exited with status {}.",
+                s.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into())
+            );
+        }
+        Err(e) => {
+            eprintln!("==> failed to spawn cargo: {}.", e);
+            eprintln!("    is the Rust toolchain installed and on PATH?");
+        }
+    }
+}
+
+fn update_cache_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(base.join("lport").join("update-check"))
+}
+
+fn unix_now() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+// Numeric semver-ish comparison. `0.10.0` > `0.9.0`. Pre-release suffixes
+// after `-` are stripped before comparison.
+fn version_gt(a: &str, b: &str) -> bool {
+    fn parse(v: &str) -> Vec<u32> {
+        v.trim()
+            .trim_start_matches('v')
+            .split('-')
+            .next()
+            .unwrap_or("")
+            .split('.')
+            .map(|s| s.parse::<u32>().unwrap_or(0))
+            .collect()
+    }
+    parse(a) > parse(b)
+}
+
+fn spawn_update_cache_refresh(cache_path: &std::path::Path) {
+    let dir = match cache_path.parent() {
+        Some(d) => d.to_string_lossy().into_owned(),
+        None => return,
+    };
+    let cache_str = cache_path.to_string_lossy().into_owned();
+    // Both paths are quoted with single quotes; embedded single quotes get
+    // the standard `'\''` escape so the shell receives the literal path.
+    let dir_q = dir.replace('\'', r"'\''");
+    let cache_q = cache_str.replace('\'', r"'\''");
+    let script = format!(
+        "v=$(curl -fsSL --max-time 5 {url} 2>/dev/null \
+            | awk -F'\"' '/^version[[:space:]]*=/ {{print $2; exit}}'); \
+         if [ -n \"$v\" ]; then \
+            mkdir -p '{dir}' && printf '%s\\n%s\\n' \"$(date +%s)\" \"$v\" > '{cache}'; \
+         fi",
+        url = UPDATE_RAW_CARGO_TOML,
+        dir = dir_q,
+        cache = cache_q,
+    );
+    // Detach: stdio piped to /dev/null. When this process exits, the child
+    // is reparented to init and continues. No wait() is needed.
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(&script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 fn nz(s: &str) -> String {
