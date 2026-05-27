@@ -2,21 +2,9 @@
 
 > List listening ports on Linux and macOS — and **which folder each server was launched from**.
 
-```
-PROTO  PORT  PID      PROCESS  JOB                                CPU   MEM   UPTIME
------  ----  -------  -------  ---------------------------------  ----  ----  -------
-tcp    3000  3478594  python3  ~/Project/scriptable               0.0%  20M   7d19h
-tcp    5174  1644291  node     ~/Project/doc-portfolio/editor     0.0%  93M   14d19h
-tcp    8080  3571557  python3  ~/obsidian_new/wiki-web            0.0%  62M   22h19m
-
-[ rsshub ]
-tcp    1200  -        docker   rsshub-rsshub-1                    -     -     7 weeks
-
-[ supabase-prod ]
-tcp    5432  -        docker   supabase_db_supabase-prod          -     -     2 days
-tcp    8000  -        docker   supabase_kong_supabase-prod        -     -     2 days
-tcp    8443  -        docker   supabase_studio_supabase-prod      -     -     2 days
-```
+<p align="center">
+  <img src="demo/dashboard.gif" alt="lport dashboard" width="780"/>
+</p>
 
 ## About
 
@@ -33,7 +21,7 @@ A tiny (~550 KB, zero-dependency) Rust CLI that answers two questions you actual
 curl -sfL https://raw.githubusercontent.com/Bae-ChangHyun/lport/main/install.sh | sh
 ```
 
-Requires the Rust toolchain (the script tells you how to install it in one line if missing).
+Requires the Rust toolchain (the script tells you how to install it in one line if missing). Re-running the installer detects the version on disk and skips work when you're already on the latest release; pass `--force` to reinstall anyway.
 
 Or directly:
 
@@ -53,50 +41,44 @@ lport kill -9 3000 8080  # SIGKILL multiple ports
 sudo lport               # full visibility into other users' processes
 ```
 
-Docker containers are grouped by their `com.docker.compose.project`
-label (falling back to the container name), so sibling containers of
-the same compose project read as one `[ project ]` block in the
-dashboard.
+Docker containers are grouped by their `com.docker.compose.project` label (falling back to the container name), so sibling containers of the same compose project read as one `[ project ]` block in the dashboard.
+
+### Detail view
+
+<p align="center">
+  <img src="demo/info.gif" alt="lport info" width="780"/>
+</p>
+
+`lport info PORT...` filters to the requested ports before reading per-PID state, so a single-port query stays cheap. The block surfaces user, CPU, MEM, threads (Linux), uptime, working directory, and the full command line. For Docker-backed ports, it adds container name, image, compose working directory, and live `docker stats` CPU / MEM.
 
 ### Killing a port
 
-```
-$ lport kill 3000
-killed pid 587649 (python3) on tcp/3000 [SIGTERM]
+<p align="center">
+  <img src="demo/kill.gif" alt="lport kill" width="780"/>
+</p>
 
+`lport kill PORT [PORT ...]` sends `SIGTERM` by default; pass `-9` or `--force` for `SIGKILL`. A PID listening on multiple ports (or on tcp+udp) receives one signal, not many.
+
+Docker-backed ports are **not** killed — `lport` prints the matching `docker stop <name>` command instead. Container lifecycle is outside `lport`'s scope.
+
+```
 $ lport kill 5432
 port tcp/5432: owned by Docker container 'supabase_db_supabase-prod'. Use: docker stop supabase_db_supabase-prod
 ```
 
-Docker-backed ports are not killed; `lport` prints the matching
-`docker stop` command instead. Pass `-9` / `--force` for `SIGKILL`.
+Exit code is `0` on full success, `1` if any port had no listener / was Docker-backed / failed to signal, and `2` on argument errors.
 
-### Detail view
+### Update notice
+
+Every invocation reads `~/.cache/lport/update-check`. When a newer upstream version is cached, `lport` prints a one-line notice underneath its normal output. On a TTY it also prompts:
 
 ```
-$ lport info 8080 2222
-─────────────────────────────────────────────
-  PORT     tcp/8080
-  PROCESS  python3
-  PID      3571557
-  USER     bch
-  CPU      0.0%
-  MEM      62M
-  THREADS  7
-  UPTIME   22h19m
-  CWD      /home/bch/obsidian_new/wiki-web
-  CMD      /home/bch/obsidian_new/wiki-web/.venv/bin/python3 app.py
-
-─────────────────────────────────────────────
-  PORT       tcp/2222 → 22 (in container)
-  TYPE       docker container
-  CONTAINER  unsloth
-  IMAGE      unsloth:latest
-  WORKDIR    /home/bch/Project/main_project/unsloth
-  CPU        0.11%
-  MEM        1.045GiB
-  UPTIME     4 weeks
+●  update available: lport 0.6.0 → 0.7.0   install now? [y/N]
 ```
+
+Pressing `y` runs `cargo install --git https://github.com/Bae-ChangHyun/lport --force`; anything else (including just hitting Enter) skips. When stdout is piped or you're not on a TTY, only the notice is printed — no prompt.
+
+The cache is refreshed in the background (detached `curl` against `main`'s `Cargo.toml`, 24 h TTL) so the check never delays startup. Set `LPORT_NO_UPDATE_CHECK=1` to disable both the notice and the background fetch.
 
 ## How it works
 
@@ -118,10 +100,10 @@ BSD `ps` on macOS has no `nlwp` (thread count), so the `THREADS` row is Linux-on
 
 And on both:
 
-- `docker ps` for container/image/compose-project mapping, keyed by `(proto, host-port)` so TCP and UDP on the same port stay distinct
+- `docker ps` for container/image/compose-project mapping, keyed by `(proto, host-port)` so TCP and UDP on the same port stay distinct. The `com.docker.compose.project` label drives the dashboard grouping; rows fall back to the container name when there is no label.
 - `docker stats --no-stream <name>` (only in `info` mode) for container CPU / MEM
 
-Dashboard runs in ~130 ms on Linux. macOS is slightly slower because it shells out to `lsof` / `ps` instead of reading `/proc`. The `info` subcommand filters to the requested port(s) before enriching, so single-port queries do not pay the whole-system cost; Docker adds ~1 s when a container is involved.
+Dashboard runs in ~130 ms on Linux. macOS is slightly slower because it shells out to `lsof` / `ps` instead of reading `/proc`. The `info` and `kill` subcommands filter to the requested port(s) before enriching, so single-port operations do not pay the whole-system cost; Docker adds ~1 s when a container is involved.
 
 The `JOB` column shows the full working directory (with `$HOME` abbreviated as `~`) and is never truncated — losing the path would defeat the feature.
 
@@ -132,6 +114,7 @@ The `JOB` column shows the full working directory (with `$HOME` abbreviated as `
 - Linux: `iproute2` (`ss`) — present on virtually every distro
 - macOS: `lsof` — preinstalled
 - Optional: `docker` for container mapping
+- Optional: `curl` for the background update check (skipped if missing)
 
 ## Limitations
 
