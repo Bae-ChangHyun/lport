@@ -139,6 +139,7 @@ fn print_help() {
     println!("                   example: lport info 8080 5432");
     println!("  kill PORT...     Terminate the process(es) listening on the given port(s).");
     println!("                   Sends SIGTERM by default; pass -9 / --force for SIGKILL.");
+    println!("                   Prompts [y/N] for each process before signaling.");
     println!("                   Docker-backed ports are not killed; lport prints the");
     println!("                   matching `docker stop` command instead.");
     println!("                   example: lport kill 3000 8080");
@@ -151,6 +152,42 @@ fn print_help() {
     println!("    Linux:  PID/PROCESS appear as '?' without sudo.");
     println!("    macOS:  other users' listeners are hidden entirely without sudo.");
     println!("  Run with `sudo lport` for full visibility across users.");
+}
+
+enum Confirm {
+    Yes,
+    No,
+    NoTty,
+}
+
+/// Prompt the user to confirm killing a single process. Returns `Yes` only on an
+/// explicit "y"/"yes". A non-interactive stdin (pipe, no TTY) cannot answer, so
+/// it returns `NoTty` and refuses rather than killing silently — same instinct
+/// as `rm -i`.
+fn confirm_kill(out: &mut impl Write, entry: &Entry, port: u32, signal_name: &str) -> Confirm {
+    if !io::stdin().is_terminal() {
+        return Confirm::NoTty;
+    }
+    let pid = entry.pid.unwrap_or(0);
+    let cwd = if entry.cwd.is_empty() { "-" } else { &entry.cwd };
+    if let Err(e) = write!(
+        out,
+        "Kill pid {} ({}) on {}/{} [cwd: {}] with {}? [y/N] ",
+        pid, entry.process, entry.proto, port, cwd, signal_name
+    ) {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+    }
+    let _ = out.flush();
+    let mut answer = String::new();
+    let yes = io::stdin().read_line(&mut answer).is_ok()
+        && matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES");
+    if yes {
+        Confirm::Yes
+    } else {
+        Confirm::No
+    }
 }
 
 fn run_kill(entries: &[Entry], ports: &[u32], force: bool) -> i32 {
@@ -199,6 +236,27 @@ fn run_kill(entries: &[Entry], ports: &[u32], force: bool) -> i32 {
             };
             if !signaled.insert(pid) {
                 continue;
+            }
+            // Confirm before signaling so a mistyped port cannot take down the
+            // wrong process. Show enough identity (pid, name, cwd) to verify.
+            match confirm_kill(&mut out, entry, port, signal_name) {
+                Confirm::Yes => {}
+                Confirm::No => {
+                    outln!(out, "skipped pid {} ({}).", pid, entry.process);
+                    continue;
+                }
+                Confirm::NoTty => {
+                    outln!(
+                        err,
+                        "port {}/{}: refusing to kill pid {} ({}) without confirmation (no TTY).",
+                        entry.proto,
+                        port,
+                        pid,
+                        entry.process
+                    );
+                    any_error = true;
+                    continue;
+                }
             }
             let status = Command::new("kill")
                 .args([signal_flag, &pid.to_string()])
