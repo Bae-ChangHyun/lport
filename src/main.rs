@@ -54,7 +54,7 @@ struct Entry {
 enum Mode {
     Dashboard { dev: bool },
     Info { ports: Vec<u32> },
-    Kill { ports: Vec<u32>, force: bool },
+    Kill { ports: Vec<u32>, force: bool, yes: bool },
 }
 
 fn main() {
@@ -90,8 +90,8 @@ fn main() {
 
     enrich_process_info(&mut entries);
 
-    if let Mode::Kill { ports, force } = &mode {
-        let code = run_kill(&entries, ports, *force);
+    if let Mode::Kill { ports, force, yes } = &mode {
+        let code = run_kill(&entries, ports, *force, *yes);
         maybe_print_update_notice();
         std::process::exit(code);
     }
@@ -129,7 +129,7 @@ fn main() {
 fn print_help() {
     println!("Usage: lport [--dev]");
     println!("       lport info PORT [PORT ...]");
-    println!("       lport kill PORT [PORT ...] [-9|--force]");
+    println!("       lport kill PORT [PORT ...] [-9|--force] [-y|--yes]");
     println!();
     println!("  (default)        Show user-launched servers and Docker containers only");
     println!("                   (PROTO PORT PID PROCESS JOB CPU MEM UPTIME)");
@@ -140,6 +140,7 @@ fn print_help() {
     println!("  kill PORT...     Terminate the process(es) listening on the given port(s).");
     println!("                   Sends SIGTERM by default; pass -9 / --force for SIGKILL.");
     println!("                   Prompts [y/N] for each process before signaling.");
+    println!("                   Pass -y / --yes to skip the prompt (non-interactive).");
     println!("                   Docker-backed ports are not killed; lport prints the");
     println!("                   matching `docker stop` command instead.");
     println!("                   example: lport kill 3000 8080");
@@ -190,7 +191,7 @@ fn confirm_kill(out: &mut impl Write, entry: &Entry, port: u32, signal_name: &st
     }
 }
 
-fn run_kill(entries: &[Entry], ports: &[u32], force: bool) -> i32 {
+fn run_kill(entries: &[Entry], ports: &[u32], force: bool, yes: bool) -> i32 {
     let signal_flag = if force { "-KILL" } else { "-TERM" };
     let signal_name = if force { "SIGKILL" } else { "SIGTERM" };
     let stdout = io::stdout();
@@ -239,7 +240,10 @@ fn run_kill(entries: &[Entry], ports: &[u32], force: bool) -> i32 {
             }
             // Confirm before signaling so a mistyped port cannot take down the
             // wrong process. Show enough identity (pid, name, cwd) to verify.
-            match confirm_kill(&mut out, entry, port, signal_name) {
+            // `-y`/`--yes` skips the prompt for non-interactive callers (scripts,
+            // service managers) that cannot answer a TTY question.
+            let decision = if yes { Confirm::Yes } else { confirm_kill(&mut out, entry, port, signal_name) };
+            match decision {
                 Confirm::Yes => {}
                 Confirm::No => {
                     outln!(out, "skipped pid {} ({}).", pid, entry.process);
@@ -336,9 +340,11 @@ fn parse_mode(args: &[String]) -> Mode {
         }
         let mut ports: Vec<u32> = Vec::new();
         let mut force = false;
+        let mut yes = false;
         for a in &args[idx + 1..] {
             match a.as_str() {
                 "-9" | "--force" => force = true,
+                "-y" | "--yes" => yes = true,
                 _ => match a.parse::<u32>() {
                     Ok(p) if p > 0 => ports.push(p),
                     _ => {
@@ -352,7 +358,7 @@ fn parse_mode(args: &[String]) -> Mode {
             eprintln!("error: 'lport kill' requires at least one port number.");
             std::process::exit(2);
         }
-        return Mode::Kill { ports, force };
+        return Mode::Kill { ports, force, yes };
     }
 
     let mut dev = false;

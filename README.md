@@ -59,6 +59,7 @@ lport info 8080          # detail block for a single port
 lport info 8080 5432     # multiple ports
 lport kill 3000          # SIGTERM the process(es) listening on port 3000
 lport kill -9 3000 8080  # SIGKILL multiple ports
+lport kill -y 3000       # skip the [y/N] prompt (non-interactive)
 sudo lport               # full visibility into other users' processes
 ```
 
@@ -84,7 +85,7 @@ The default view groups Docker containers by their `com.docker.compose.project` 
   <img src="demo/kill.gif" alt="lport kill" width="780"/>
 </p>
 
-`lport kill PORT [PORT ...]` sends `SIGTERM` by default; pass `-9` or `--force` for `SIGKILL`. A PID listening on multiple ports (or on tcp+udp) receives one signal, not many.
+`lport kill PORT [PORT ...]` sends `SIGTERM` by default; pass `-9` or `--force` for `SIGKILL`. A PID listening on multiple ports (or on tcp+udp) receives one signal, not many. Each process is confirmed with a `[y/N]` prompt; pass `-y` / `--yes` to skip it for non-interactive callers (scripts, service managers).
 
 Docker-backed ports are **not** killed — `lport` prints the matching `docker stop <name>` command instead. Container lifecycle is outside `lport`'s scope.
 
