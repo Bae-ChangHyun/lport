@@ -721,9 +721,18 @@ fn normalize_addr(a: &str) -> &str {
 }
 
 fn ip_matches(docker_ip: &str, local_addr: &str) -> bool {
-    is_wildcard_addr(docker_ip)
-        || is_wildcard_addr(local_addr)
-        || normalize_addr(docker_ip) == normalize_addr(local_addr)
+    let d = normalize_addr(docker_ip);
+    let l = normalize_addr(local_addr);
+    // "*" / empty carry no stack information (macOS lsof prints "*:port").
+    if d.is_empty() || d == "*" || l.is_empty() || l == "*" {
+        return true;
+    }
+    // A v4 publish must not claim a v6 listener (or vice versa): they are
+    // different sockets that merely share a port number.
+    if d.contains(':') != l.contains(':') {
+        return false;
+    }
+    d == l || is_wildcard_addr(d) || is_wildcard_addr(l)
 }
 
 fn docker_lookup(
