@@ -149,6 +149,7 @@ Dashboard runs in ~130 ms on Linux. macOS is slightly slower because it shells o
 - **Unix only.** Windows is not supported.
 - Without `sudo`, processes owned by other users show as `?` (Linux) or are hidden entirely (macOS — `lsof` cannot read foreign process state without privileges).
 - Containers started with plain `docker run` (not compose) display `WORKDIR: -` — Docker doesn't record the CLI invocation directory.
+- With `userland-proxy: false` in `dockerd`, a published port has no host listener of its own (traffic is routed by iptables). An unrelated local process bound to that same port is then shown as the container's row.
 
 ## License
 

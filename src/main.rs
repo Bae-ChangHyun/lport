@@ -17,6 +17,15 @@ macro_rules! outln {
     }};
 }
 
+// Reporting variant for the kill path. A closed pipe (`lport kill 3000 8080 | head -1`)
+// must not abort the run: the remaining ports still have to be signaled, and the exit
+// code still has to reflect what happened. Kill output is best-effort; the signals are not.
+macro_rules! outln_soft {
+    ($out:expr, $($arg:tt)*) => {{
+        let _ = writeln!($out, $($arg)*);
+    }};
+}
+
 #[derive(Default, Clone)]
 struct Stats {
     cpu: String,
@@ -142,8 +151,8 @@ fn main() {
     enrich_docker_stats(&mut entries, with_docker_cpu_mem);
 
     match mode {
-        Mode::Info { .. } => {
-            let code = print_info(&entries);
+        Mode::Info { ports } => {
+            let code = print_info(&entries, &ports);
             maybe_print_update_notice();
             std::process::exit(code);
         }
@@ -293,7 +302,7 @@ fn report_kill_failure(
     status: std::process::ExitStatus,
     stderr_bytes: &[u8],
 ) {
-    outln!(
+    outln_soft!(
         err,
         "port {}/{}: `kill {} {}` exited with status {}.",
         proto,
@@ -308,9 +317,9 @@ fn report_kill_failure(
     let detail = String::from_utf8_lossy(stderr_bytes);
     let detail = detail.trim();
     if !detail.is_empty() {
-        outln!(err, "  {}", detail);
+        outln_soft!(err, "  {}", detail);
         if detail.to_ascii_lowercase().contains("not permitted") {
-            outln!(err, "hint: try `sudo lport kill {}`", port);
+            outln_soft!(err, "hint: try `sudo lport kill {}`", port);
         }
     }
 }
@@ -336,6 +345,10 @@ fn run_kill(
     // PIDs the user declined at the prompt: skip them on later ports without
     // claiming they were handled — no signal was ever sent.
     let mut declined: HashSet<u32> = HashSet::new();
+    // PIDs whose first signal could not be delivered (EPERM, `kill` failed to spawn).
+    // Same reason as `declined`: nothing reached the process, so "already handled"
+    // would be a lie on the next port.
+    let mut failed: HashSet<u32> = HashSet::new();
     // Ports whose owner was confirmed dead — the only ones worth re-scanning for
     // a supervisor-spawned replacement.
     let mut freed_ports: HashSet<u32> = HashSet::new();
@@ -343,14 +356,14 @@ fn run_kill(
     for &port in ports {
         let matches: Vec<&Entry> = entries.iter().filter(|e| e.port == port).collect();
         if matches.is_empty() {
-            outln!(err, "port {}: no listening process found.", port);
+            outln_soft!(err, "port {}: no listening process found.", port);
             any_error = true;
             continue;
         }
 
         for entry in &matches {
             if let Some(d) = &entry.docker {
-                outln!(
+                outln_soft!(
                     err,
                     "port {}/{}: owned by Docker container '{}'. Use: docker stop {}",
                     entry.proto,
@@ -362,7 +375,7 @@ fn run_kill(
                 continue;
             }
             let Some(pid) = entry.pid else {
-                outln!(
+                outln_soft!(
                     err,
                     "port {}/{}: PID unknown (insufficient privileges?). Try `sudo lport kill {}`.",
                     entry.proto,
@@ -373,7 +386,7 @@ fn run_kill(
                 continue;
             };
             if signaled.contains(&pid) {
-                outln!(
+                outln_soft!(
                     out,
                     "pid {} already handled (also listens on {}/{}).",
                     pid,
@@ -383,7 +396,17 @@ fn run_kill(
                 continue;
             }
             if declined.contains(&pid) {
-                outln!(out, "pid {} declined earlier; skipping {}/{}.", pid, entry.proto, port);
+                outln_soft!(out, "pid {} declined earlier; skipping {}/{}.", pid, entry.proto, port);
+                continue;
+            }
+            if failed.contains(&pid) {
+                outln_soft!(
+                    out,
+                    "pid {} could not be signaled earlier; skipping {}/{}.",
+                    pid,
+                    entry.proto,
+                    port
+                );
                 continue;
             }
             // Confirm before signaling so a mistyped port cannot take down the
@@ -399,12 +422,12 @@ fn run_kill(
                 Confirm::Yes => {}
                 Confirm::No => {
                     declined.insert(pid);
-                    outln!(out, "skipped pid {} ({}).", pid, entry.process);
+                    outln_soft!(out, "skipped pid {} ({}).", pid, entry.process);
                     continue;
                 }
                 Confirm::NoTty => {
                     declined.insert(pid);
-                    outln!(
+                    outln_soft!(
                         err,
                         "port {}/{}: refusing to kill pid {} ({}) without confirmation (no TTY).",
                         entry.proto,
@@ -421,7 +444,7 @@ fn run_kill(
             // which would report a failure for a port that is in fact free.
             if !pid_alive(pid) {
                 signaled.insert(pid);
-                outln!(out, "pid {} ({}) already exited.", pid, entry.process);
+                outln_soft!(out, "pid {} ({}) already exited.", pid, entry.process);
                 freed_ports.insert(port);
                 continue;
             }
@@ -432,6 +455,8 @@ fn run_kill(
             match output {
                 Ok(o) if o.status.success() => {}
                 Ok(o) => {
+                    signaled.remove(&pid);
+                    failed.insert(pid);
                     report_kill_failure(
                         &mut err,
                         entry.proto,
@@ -445,7 +470,9 @@ fn run_kill(
                     continue;
                 }
                 Err(spawn_err) => {
-                    outln!(
+                    signaled.remove(&pid);
+                    failed.insert(pid);
+                    outln_soft!(
                         err,
                         "port {}/{}: failed to spawn `kill`: {}.",
                         entry.proto,
@@ -458,7 +485,7 @@ fn run_kill(
             }
 
             if wait_for_exit(pid, KILL_WAIT_MS) {
-                outln!(
+                outln_soft!(
                     out,
                     "killed pid {} ({}) on {}/{} [{}]",
                     pid,
@@ -472,7 +499,7 @@ fn run_kill(
             }
 
             if force {
-                outln!(
+                outln_soft!(
                     err,
                     "port {}/{}: pid {} ({}) still alive {}s after SIGKILL (uninterruptible I/O?).",
                     entry.proto,
@@ -485,7 +512,7 @@ fn run_kill(
                 continue;
             }
 
-            outln!(
+            outln_soft!(
                 err,
                 "port {}/{}: pid {} ({}) still alive {}s after SIGTERM.",
                 entry.proto,
@@ -495,19 +522,19 @@ fn run_kill(
                 KILL_WAIT_MS / 1000
             );
             if yes || !io::stdin().is_terminal() {
-                outln!(err, "hint: retry with `lport kill -9 {}`", port);
+                outln_soft!(err, "hint: retry with `lport kill -9 {}`", port);
                 any_error = true;
                 continue;
             }
             if !prompt_yes_no("Escalate to SIGKILL? [y/N] ") {
-                outln!(out, "skipped escalation for pid {} ({}).", pid, entry.process);
+                outln_soft!(out, "skipped escalation for pid {} ({}).", pid, entry.process);
                 any_error = true;
                 continue;
             }
             // A slow-but-obedient process can finish shutting down while the escalation
             // prompt waits — SIGTERM worked, it just took longer than KILL_WAIT_MS.
             if !pid_alive(pid) {
-                outln!(
+                outln_soft!(
                     out,
                     "pid {} ({}) exited on its own after SIGTERM.",
                     pid,
@@ -535,7 +562,7 @@ fn run_kill(
                     continue;
                 }
                 Err(spawn_err) => {
-                    outln!(
+                    outln_soft!(
                         err,
                         "port {}/{}: failed to spawn `kill`: {}.",
                         entry.proto,
@@ -547,7 +574,7 @@ fn run_kill(
                 }
             }
             if wait_for_exit(pid, ESCALATE_WAIT_MS) {
-                outln!(
+                outln_soft!(
                     out,
                     "killed pid {} ({}) on {}/{} [SIGKILL]",
                     pid,
@@ -557,7 +584,7 @@ fn run_kill(
                 );
                 freed_ports.insert(port);
             } else {
-                outln!(
+                outln_soft!(
                     err,
                     "port {}/{}: pid {} ({}) still alive {}s after SIGKILL (uninterruptible I/O?).",
                     entry.proto,
@@ -605,7 +632,7 @@ fn warn_on_restart(
         if signaled.contains(&pid) || declined.contains(&pid) || !warned.insert((e.proto, e.port, pid)) {
             continue;
         }
-        outln!(
+        outln_soft!(
             err,
             "warning: port {}/{} is listening again (pid {}, {}) — likely restarted by a supervisor (dev server, systemd). Inspect with `lport info {}`.",
             e.proto,
@@ -754,6 +781,11 @@ fn ip_matches(docker_ip: &str, local_addr: &str) -> bool {
     d == l || is_wildcard_addr(d) || is_wildcard_addr(l)
 }
 
+// Known limit: with `userland-proxy: false` there is no docker-proxy listener behind a
+// published port (iptables does the routing), so an unrelated local process on that port
+// matches the publish and is shown as the container. Verifying the listener's comm would
+// fix that case but break the legitimate ones (rootless docker, Docker Desktop), so the
+// mismatch is documented in the README rather than guessed at here.
 fn docker_lookup(
     map: &DockerMap,
     proto: &'static str,
@@ -1761,13 +1793,18 @@ fn shorten_path(s: &str, home: Option<&str>) -> String {
     s.to_string()
 }
 
-fn print_info(entries: &[Entry]) -> i32 {
+fn print_info(entries: &[Entry], ports: &[u32]) -> i32 {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    if entries.is_empty() {
-        eprintln!("(no matching port found)");
-        return 1;
+    // Report each requested port that has no listener, the way `kill` does. A single
+    // "(no matching port found)" hid which port of `lport info 5432 59321` was empty.
+    let mut missing = false;
+    for &port in ports {
+        if !entries.iter().any(|e| e.port == port) {
+            eprintln!("port {}: no listening process found.", port);
+            missing = true;
+        }
     }
 
     for (i, e) in entries.iter().enumerate() {
@@ -1784,7 +1821,7 @@ fn print_info(entries: &[Entry]) -> i32 {
             outln!(out, "  {:<width$}  {}", label, value, width = label_w);
         }
     }
-    0
+    if missing { 1 } else { 0 }
 }
 
 fn local_info_rows(e: &Entry) -> Vec<(&'static str, String)> {
