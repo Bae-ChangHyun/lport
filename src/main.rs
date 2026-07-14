@@ -142,7 +142,11 @@ fn main() {
     enrich_docker_stats(&mut entries, with_docker_cpu_mem);
 
     match mode {
-        Mode::Info { .. } => print_info(&entries),
+        Mode::Info { .. } => {
+            let code = print_info(&entries);
+            maybe_print_update_notice();
+            std::process::exit(code);
+        }
         Mode::Dashboard { dev } => print_table(&entries, dev),
         // Kill mode already exited via `run_kill` above; this arm exists only
         // to satisfy exhaustiveness.
@@ -326,8 +330,12 @@ fn run_kill(
     let mut err = stderr.lock();
     let mut any_error = false;
     // Dedup across ports: a single PID listening on tcp+udp or on multiple
-    // ports given on one command line should only receive one signal.
+    // ports given on one command line should only receive one signal. Only
+    // PIDs actually signaled (or confirmed already exited) belong here.
     let mut signaled: HashSet<u32> = HashSet::new();
+    // PIDs the user declined at the prompt: skip them on later ports without
+    // claiming they were handled — no signal was ever sent.
+    let mut declined: HashSet<u32> = HashSet::new();
     // Ports whose owner was confirmed dead — the only ones worth re-scanning for
     // a supervisor-spawned replacement.
     let mut freed_ports: HashSet<u32> = HashSet::new();
@@ -364,7 +372,7 @@ fn run_kill(
                 any_error = true;
                 continue;
             };
-            if !signaled.insert(pid) {
+            if signaled.contains(&pid) {
                 outln!(
                     out,
                     "pid {} already handled (also listens on {}/{}).",
@@ -372,6 +380,10 @@ fn run_kill(
                     entry.proto,
                     port
                 );
+                continue;
+            }
+            if declined.contains(&pid) {
+                outln!(out, "pid {} declined earlier; skipping {}/{}.", pid, entry.proto, port);
                 continue;
             }
             // Confirm before signaling so a mistyped port cannot take down the
@@ -386,10 +398,12 @@ fn run_kill(
             match decision {
                 Confirm::Yes => {}
                 Confirm::No => {
+                    declined.insert(pid);
                     outln!(out, "skipped pid {} ({}).", pid, entry.process);
                     continue;
                 }
                 Confirm::NoTty => {
+                    declined.insert(pid);
                     outln!(
                         err,
                         "port {}/{}: refusing to kill pid {} ({}) without confirmation (no TTY).",
@@ -406,10 +420,12 @@ fn run_kill(
             // the user was deciding. Signaling a dead PID fails with "No such process",
             // which would report a failure for a port that is in fact free.
             if !pid_alive(pid) {
+                signaled.insert(pid);
                 outln!(out, "pid {} ({}) already exited.", pid, entry.process);
                 freed_ports.insert(port);
                 continue;
             }
+            signaled.insert(pid);
             let output = Command::new("kill")
                 .args([signal_flag, &pid.to_string()])
                 .output();
@@ -555,7 +571,7 @@ fn run_kill(
         }
     }
 
-    warn_on_restart(&mut err, &freed_ports, &signaled, docker_map);
+    warn_on_restart(&mut err, &freed_ports, &signaled, &declined, docker_map);
 
     if any_error {
         1
@@ -571,6 +587,7 @@ fn warn_on_restart(
     err: &mut impl Write,
     freed_ports: &HashSet<u32>,
     signaled: &HashSet<u32>,
+    declined: &HashSet<u32>,
     docker_map: &DockerMap,
 ) {
     if freed_ports.is_empty() {
@@ -583,7 +600,9 @@ fn warn_on_restart(
             continue;
         }
         let Some(pid) = e.pid else { continue };
-        if signaled.contains(&pid) || !warned.insert((e.proto, e.port, pid)) {
+        // A declined PID was on the port all along — that is not a supervisor
+        // reviving anything, so it does not deserve a restart warning.
+        if signaled.contains(&pid) || declined.contains(&pid) || !warned.insert((e.proto, e.port, pid)) {
             continue;
         }
         outln!(
@@ -1028,7 +1047,9 @@ fn collect_lsof(
         if line.is_empty() {
             continue;
         }
-        let (tag, val) = line.split_at(1);
+        // A value with an embedded newline spills untagged continuation lines;
+        // drop them (a multi-byte first char would make split_at(1) panic).
+        let Some((tag, val)) = line.split_at_checked(1) else { continue };
         match tag {
             "p" => {
                 if has_file {
@@ -1289,7 +1310,9 @@ fn enrich_process_info(entries: &mut [Entry]) {
             if line.is_empty() {
                 continue;
             }
-            let (tag, val) = line.split_at(1);
+            // A value with an embedded newline spills untagged continuation lines;
+            // drop them (a multi-byte first char would make split_at(1) panic).
+            let Some((tag, val)) = line.split_at_checked(1) else { continue };
             match tag {
                 "p" => cur_pid = val.parse().ok(),
                 "n" => {
@@ -1738,13 +1761,13 @@ fn shorten_path(s: &str, home: Option<&str>) -> String {
     s.to_string()
 }
 
-fn print_info(entries: &[Entry]) {
+fn print_info(entries: &[Entry]) -> i32 {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
     if entries.is_empty() {
         eprintln!("(no matching port found)");
-        return;
+        return 1;
     }
 
     for (i, e) in entries.iter().enumerate() {
@@ -1761,6 +1784,7 @@ fn print_info(entries: &[Entry]) {
             outln!(out, "  {:<width$}  {}", label, value, width = label_w);
         }
     }
+    0
 }
 
 fn local_info_rows(e: &Entry) -> Vec<(&'static str, String)> {
