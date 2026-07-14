@@ -611,7 +611,7 @@ fn run_kill(
         }
     }
 
-    warn_on_restart(&mut err, &freed_ports, &signaled, &declined, docker_map);
+    warn_on_restart(&mut err, &freed_ports, &signaled, &declined, &failed, docker_map);
 
     if any_error {
         1
@@ -628,6 +628,7 @@ fn warn_on_restart(
     freed_ports: &HashSet<u32>,
     signaled: &HashSet<u32>,
     declined: &HashSet<u32>,
+    failed: &HashSet<u32>,
     docker_map: &DockerMap,
 ) {
     if freed_ports.is_empty() {
@@ -640,9 +641,14 @@ fn warn_on_restart(
             continue;
         }
         let Some(pid) = e.pid else { continue };
-        // A declined PID was on the port all along — that is not a supervisor
-        // reviving anything, so it does not deserve a restart warning.
-        if signaled.contains(&pid) || declined.contains(&pid) || !warned.insert((e.proto, e.port, pid)) {
+        // A declined PID — or one whose signal never got delivered — was on the port all
+        // along. Neither is a supervisor reviving anything, so neither deserves a restart
+        // warning; the port simply still belongs to whoever already had it.
+        if signaled.contains(&pid)
+            || declined.contains(&pid)
+            || failed.contains(&pid)
+            || !warned.insert((e.proto, e.port, pid))
+        {
             continue;
         }
         outln_soft!(
@@ -1858,18 +1864,21 @@ fn print_info(entries: &[Entry], ports: &[u32]) -> i32 {
         }
     }
 
+    // Soft writes: `info` owes the caller an exit code (a missing port is 1), and exiting
+    // 0 on a closed pipe would silently break that contract. There is nothing to gain from
+    // bailing out early either — `info` prints a handful of rows, not a whole system.
     for (i, e) in entries.iter().enumerate() {
         if i > 0 {
-            outln!(out, "");
+            outln_soft!(out, "");
         }
-        outln!(out, "─────────────────────────────────────────────");
+        outln_soft!(out, "─────────────────────────────────────────────");
         let rows: Vec<(&str, String)> = match &e.docker {
             Some(d) => docker_info_rows(e, d),
             None => local_info_rows(e),
         };
         let label_w = rows.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
         for (label, value) in &rows {
-            outln!(out, "  {:<width$}  {}", label, value, width = label_w);
+            outln_soft!(out, "  {:<width$}  {}", label, value, width = label_w);
         }
     }
     if missing { 1 } else { 0 }
