@@ -215,27 +215,32 @@ fn confirm_kill(entry: &Entry, port: u32, signal_name: &str) -> Confirm {
     }
     let pid = entry.pid.unwrap_or(0);
     let cwd = if entry.cwd.is_empty() { "-" } else { &entry.cwd };
-    if prompt_yes_no(&format!(
+    match prompt_yes_no(&format!(
         "Kill pid {} ({}) on {}/{} [cwd: {}] with {}? [y/N] ",
         pid, entry.process, entry.proto, port, cwd, signal_name
     )) {
-        Confirm::Yes
-    } else {
-        Confirm::No
+        Some(true) => Confirm::Yes,
+        Some(false) => Confirm::No,
+        // A stderr that cannot be written to is a stderr the user cannot read: consent
+        // is unobtainable, exactly as with no TTY. Refuse through the same path.
+        None => Confirm::NoTty,
     }
 }
 
-fn prompt_yes_no(prompt: &str) -> bool {
+/// `None` means the question could not be asked. Never exits: a dead prompt must not
+/// cut the kill run short with a success code — the caller decides, and its answer is
+/// always to refuse.
+fn prompt_yes_no(prompt: &str) -> Option<bool> {
     let mut err = io::stderr();
-    if let Err(e) = write!(err, "{}", prompt) {
-        if e.kind() == io::ErrorKind::BrokenPipe {
-            std::process::exit(0);
-        }
+    if write!(err, "{}", prompt).is_err() {
+        return None;
     }
     let _ = err.flush();
     let mut answer = String::new();
-    io::stdin().read_line(&mut answer).is_ok()
-        && matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
+    Some(
+        io::stdin().read_line(&mut answer).is_ok()
+            && matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES"),
+    )
 }
 
 // A signal is only *delivered*, never *obeyed*: a process can ignore SIGTERM, and
@@ -537,7 +542,7 @@ fn run_kill(
                 any_error = true;
                 continue;
             }
-            if !prompt_yes_no("Escalate to SIGKILL? [y/N] ") {
+            if !matches!(prompt_yes_no("Escalate to SIGKILL? [y/N] "), Some(true)) {
                 outln_soft!(out, "skipped escalation for pid {} ({}).", pid, entry.process);
                 any_error = true;
                 continue;
