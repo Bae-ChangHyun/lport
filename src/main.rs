@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -91,7 +91,7 @@ fn main() {
     enrich_process_info(&mut entries);
 
     if let Mode::Kill { ports, force, yes } = &mode {
-        let code = run_kill(&entries, ports, *force, *yes);
+        let code = run_kill(&entries, ports, *force, *yes, &docker_map);
         maybe_print_update_notice();
         std::process::exit(code);
     }
@@ -141,6 +141,8 @@ fn print_help() {
     println!("                   Sends SIGTERM by default; pass -9 / --force for SIGKILL.");
     println!("                   Prompts [y/N] for each process before signaling.");
     println!("                   Pass -y / --yes to skip the prompt (non-interactive).");
+    println!("                   Verifies the process actually exited; offers SIGKILL");
+    println!("                   escalation if it survives SIGTERM.");
     println!("                   Docker-backed ports are not killed; lport prints the");
     println!("                   matching `docker stop` command instead.");
     println!("                   example: lport kill 3000 8080");
@@ -165,33 +167,121 @@ enum Confirm {
 /// explicit "y"/"yes". A non-interactive stdin (pipe, no TTY) cannot answer, so
 /// it returns `NoTty` and refuses rather than killing silently — same instinct
 /// as `rm -i`.
-fn confirm_kill(out: &mut impl Write, entry: &Entry, port: u32, signal_name: &str) -> Confirm {
+///
+/// The prompt goes to stderr: stdout carries the result lines and may be piped,
+/// which would otherwise leave the caller staring at a silent read.
+fn confirm_kill(entry: &Entry, port: u32, signal_name: &str) -> Confirm {
     if !io::stdin().is_terminal() {
         return Confirm::NoTty;
     }
     let pid = entry.pid.unwrap_or(0);
     let cwd = if entry.cwd.is_empty() { "-" } else { &entry.cwd };
-    if let Err(e) = write!(
-        out,
+    if prompt_yes_no(&format!(
         "Kill pid {} ({}) on {}/{} [cwd: {}] with {}? [y/N] ",
         pid, entry.process, entry.proto, port, cwd, signal_name
-    ) {
-        if e.kind() == io::ErrorKind::BrokenPipe {
-            std::process::exit(0);
-        }
-    }
-    let _ = out.flush();
-    let mut answer = String::new();
-    let yes = io::stdin().read_line(&mut answer).is_ok()
-        && matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES");
-    if yes {
+    )) {
         Confirm::Yes
     } else {
         Confirm::No
     }
 }
 
-fn run_kill(entries: &[Entry], ports: &[u32], force: bool, yes: bool) -> i32 {
+fn prompt_yes_no(prompt: &str) -> bool {
+    let mut err = io::stderr();
+    if let Err(e) = write!(err, "{}", prompt) {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+    }
+    let _ = err.flush();
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer).is_ok()
+        && matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
+}
+
+// A signal is only *delivered*, never *obeyed*: a process can ignore SIGTERM, and
+// even SIGKILL cannot reap one stuck in uninterruptible I/O. So `lport kill` waits
+// for the PID to actually disappear before it claims the port is free.
+const KILL_WAIT_MS: u64 = 3000;
+const ESCALATE_WAIT_MS: u64 = 2000;
+
+#[cfg(target_os = "linux")]
+fn pid_alive(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid)) else {
+        return false;
+    };
+    let Some(rparen) = stat.rfind(')') else {
+        return false;
+    };
+    let state = stat[rparen + 1..].split_whitespace().next().unwrap_or("");
+    // A zombie (or dying) process has already released its sockets — the port is
+    // free even though the /proc entry lingers until the parent reaps it.
+    !matches!(state, "Z" | "X")
+}
+
+#[cfg(target_os = "macos")]
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Poll until the PID is gone. Returns true if the exit was observed.
+fn wait_for_exit(pid: u32, timeout_ms: u64) -> bool {
+    let mut waited = 0;
+    while waited < timeout_ms {
+        if !pid_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        waited += 100;
+    }
+    !pid_alive(pid)
+}
+
+// `kill` writes its own diagnostic ("Operation not permitted", "No such process")
+// to stderr. It is captured rather than inherited so it cannot interleave with
+// lport's output, then replayed under the failing port.
+fn report_kill_failure(
+    err: &mut impl Write,
+    proto: &str,
+    port: u32,
+    pid: u32,
+    signal_flag: &str,
+    status: std::process::ExitStatus,
+    stderr_bytes: &[u8],
+) {
+    outln!(
+        err,
+        "port {}/{}: `kill {} {}` exited with status {}.",
+        proto,
+        port,
+        signal_flag,
+        pid,
+        status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "?".into())
+    );
+    let detail = String::from_utf8_lossy(stderr_bytes);
+    let detail = detail.trim();
+    if !detail.is_empty() {
+        outln!(err, "  {}", detail);
+        if detail.to_ascii_lowercase().contains("not permitted") {
+            outln!(err, "hint: try `sudo lport kill {}`", port);
+        }
+    }
+}
+
+fn run_kill(
+    entries: &[Entry],
+    ports: &[u32],
+    force: bool,
+    yes: bool,
+    docker_map: &DockerMap,
+) -> i32 {
     let signal_flag = if force { "-KILL" } else { "-TERM" };
     let signal_name = if force { "SIGKILL" } else { "SIGTERM" };
     let stdout = io::stdout();
@@ -202,6 +292,9 @@ fn run_kill(entries: &[Entry], ports: &[u32], force: bool, yes: bool) -> i32 {
     // Dedup across ports: a single PID listening on tcp+udp or on multiple
     // ports given on one command line should only receive one signal.
     let mut signaled: HashSet<u32> = HashSet::new();
+    // Ports whose owner was confirmed dead — the only ones worth re-scanning for
+    // a supervisor-spawned replacement.
+    let mut freed_ports: HashSet<u32> = HashSet::new();
 
     for &port in ports {
         let matches: Vec<&Entry> = entries.iter().filter(|e| e.port == port).collect();
@@ -236,13 +329,24 @@ fn run_kill(entries: &[Entry], ports: &[u32], force: bool, yes: bool) -> i32 {
                 continue;
             };
             if !signaled.insert(pid) {
+                outln!(
+                    out,
+                    "pid {} already handled (also listens on {}/{}).",
+                    pid,
+                    entry.proto,
+                    port
+                );
                 continue;
             }
             // Confirm before signaling so a mistyped port cannot take down the
             // wrong process. Show enough identity (pid, name, cwd) to verify.
             // `-y`/`--yes` skips the prompt for non-interactive callers (scripts,
             // service managers) that cannot answer a TTY question.
-            let decision = if yes { Confirm::Yes } else { confirm_kill(&mut out, entry, port, signal_name) };
+            let decision = if yes {
+                Confirm::Yes
+            } else {
+                confirm_kill(entry, port, signal_name)
+            };
             match decision {
                 Confirm::Yes => {}
                 Confirm::No => {
@@ -262,32 +366,23 @@ fn run_kill(entries: &[Entry], ports: &[u32], force: bool, yes: bool) -> i32 {
                     continue;
                 }
             }
-            let status = Command::new("kill")
+            let output = Command::new("kill")
                 .args([signal_flag, &pid.to_string()])
-                .status();
-            match status {
-                Ok(s) if s.success() => {
-                    outln!(
-                        out,
-                        "killed pid {} ({}) on {}/{} [{}]",
+                .output();
+            match output {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => {
+                    report_kill_failure(
+                        &mut err,
+                        entry.proto,
+                        port,
                         pid,
-                        entry.process,
-                        entry.proto,
-                        port,
-                        signal_name
-                    );
-                }
-                Ok(s) => {
-                    outln!(
-                        err,
-                        "port {}/{}: `kill {} {}` exited with status {}.",
-                        entry.proto,
-                        port,
                         signal_flag,
-                        pid,
-                        s.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into())
+                        o.status,
+                        &o.stderr,
                     );
                     any_error = true;
+                    continue;
                 }
                 Err(spawn_err) => {
                     outln!(
@@ -298,14 +393,152 @@ fn run_kill(entries: &[Entry], ports: &[u32], force: bool, yes: bool) -> i32 {
                         spawn_err
                     );
                     any_error = true;
+                    continue;
                 }
+            }
+
+            if wait_for_exit(pid, KILL_WAIT_MS) {
+                outln!(
+                    out,
+                    "killed pid {} ({}) on {}/{} [{}]",
+                    pid,
+                    entry.process,
+                    entry.proto,
+                    port,
+                    signal_name
+                );
+                freed_ports.insert(port);
+                continue;
+            }
+
+            if force {
+                outln!(
+                    err,
+                    "port {}/{}: pid {} ({}) still alive {}s after SIGKILL (uninterruptible I/O?).",
+                    entry.proto,
+                    port,
+                    pid,
+                    entry.process,
+                    KILL_WAIT_MS / 1000
+                );
+                any_error = true;
+                continue;
+            }
+
+            outln!(
+                err,
+                "port {}/{}: pid {} ({}) still alive {}s after SIGTERM.",
+                entry.proto,
+                port,
+                pid,
+                entry.process,
+                KILL_WAIT_MS / 1000
+            );
+            if yes || !io::stdin().is_terminal() {
+                outln!(err, "hint: retry with `lport kill -9 {}`", port);
+                any_error = true;
+                continue;
+            }
+            if !prompt_yes_no("Escalate to SIGKILL? [y/N] ") {
+                outln!(out, "skipped escalation for pid {} ({}).", pid, entry.process);
+                any_error = true;
+                continue;
+            }
+            let output = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .output();
+            match output {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => {
+                    report_kill_failure(
+                        &mut err,
+                        entry.proto,
+                        port,
+                        pid,
+                        "-KILL",
+                        o.status,
+                        &o.stderr,
+                    );
+                    any_error = true;
+                    continue;
+                }
+                Err(spawn_err) => {
+                    outln!(
+                        err,
+                        "port {}/{}: failed to spawn `kill`: {}.",
+                        entry.proto,
+                        port,
+                        spawn_err
+                    );
+                    any_error = true;
+                    continue;
+                }
+            }
+            if wait_for_exit(pid, ESCALATE_WAIT_MS) {
+                outln!(
+                    out,
+                    "killed pid {} ({}) on {}/{} [SIGKILL]",
+                    pid,
+                    entry.process,
+                    entry.proto,
+                    port
+                );
+                freed_ports.insert(port);
+            } else {
+                outln!(
+                    err,
+                    "port {}/{}: pid {} ({}) still alive {}s after SIGKILL (uninterruptible I/O?).",
+                    entry.proto,
+                    port,
+                    pid,
+                    entry.process,
+                    ESCALATE_WAIT_MS / 1000
+                );
+                any_error = true;
             }
         }
     }
+
+    warn_on_restart(&mut err, &freed_ports, &signaled, docker_map);
+
     if any_error {
         1
     } else {
         0
+    }
+}
+
+// A freed port that is listening again seconds later was not freed for the user:
+// something (nodemon, a systemd unit, docker restart policy) put a new process
+// there. The kill itself succeeded, so this warns without failing the exit code.
+fn warn_on_restart(
+    err: &mut impl Write,
+    freed_ports: &HashSet<u32>,
+    signaled: &HashSet<u32>,
+    docker_map: &DockerMap,
+) {
+    if freed_ports.is_empty() {
+        return;
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let mut warned: HashSet<(&'static str, u32, u32)> = HashSet::new();
+    for e in collect_listening(docker_map) {
+        if e.docker.is_some() || !freed_ports.contains(&e.port) {
+            continue;
+        }
+        let Some(pid) = e.pid else { continue };
+        if signaled.contains(&pid) || !warned.insert((e.proto, e.port, pid)) {
+            continue;
+        }
+        outln!(
+            err,
+            "warning: port {}/{} is listening again (pid {}, {}) — likely restarted by a supervisor (dev server, systemd). Inspect with `lport info {}`.",
+            e.proto,
+            e.port,
+            pid,
+            e.process,
+            e.port
+        );
     }
 }
 
@@ -319,7 +552,7 @@ fn parse_mode(args: &[String]) -> Mode {
         let mut ports: Vec<u32> = Vec::new();
         for a in &args[idx + 1..] {
             match a.parse::<u32>() {
-                Ok(p) if p > 0 => ports.push(p),
+                Ok(p) if (1..=65535).contains(&p) => ports.push(p),
                 _ => {
                     eprintln!("error: invalid port '{}'", a);
                     std::process::exit(2);
@@ -346,7 +579,7 @@ fn parse_mode(args: &[String]) -> Mode {
                 "-9" | "--force" => force = true,
                 "-y" | "--yes" => yes = true,
                 _ => match a.parse::<u32>() {
-                    Ok(p) if p > 0 => ports.push(p),
+                    Ok(p) if (1..=65535).contains(&p) => ports.push(p),
                     _ => {
                         eprintln!("error: invalid port '{}'", a);
                         std::process::exit(2);

@@ -87,6 +87,8 @@ The default view groups Docker containers by their `com.docker.compose.project` 
 
 `lport kill PORT [PORT ...]` sends `SIGTERM` by default; pass `-9` or `--force` for `SIGKILL`. A PID listening on multiple ports (or on tcp+udp) receives one signal, not many. Each process is confirmed with a `[y/N]` prompt; pass `-y` / `--yes` to skip it for non-interactive callers (scripts, service managers).
 
+Sending a signal is not the same as the process obeying it, so `lport` waits up to 3 seconds for the PID to actually disappear before reporting `killed`. If a process survives `SIGTERM`, an interactive run offers to escalate to `SIGKILL`; a non-interactive one prints a `lport kill -9 PORT` hint and exits `1`. When a killed port starts listening again moments later, `lport` warns that a supervisor (dev server, systemd) most likely restarted it.
+
 Docker-backed ports are **not** killed — `lport` prints the matching `docker stop <name>` command instead. Container lifecycle is outside `lport`'s scope.
 
 ```
