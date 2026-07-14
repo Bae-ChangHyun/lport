@@ -230,11 +230,21 @@ fn pid_alive(pid: u32) -> bool {
 
 #[cfg(target_os = "macos")]
 fn pid_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
+    // Not `kill -0`: that succeeds for a zombie, and a zombie has already released
+    // its sockets — the port is free even though the entry lingers until the parent
+    // reaps it. BSD `ps` reports zombies with a state starting in 'Z'.
+    let Ok(output) = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let state = String::from_utf8_lossy(&output.stdout);
+    let state = state.trim();
+    !state.is_empty() && !state.starts_with('Z')
 }
 
 /// Poll until the PID is gone. Returns true if the exit was observed.
@@ -1139,7 +1149,13 @@ fn read_has_tty_proc(pid: u32) -> bool {
 fn read_exe_basename_proc(pid: u32) -> Option<String> {
     let path = fs::read_link(format!("/proc/{}/exe", pid)).ok()?;
     let name = path.file_name()?.to_string_lossy().into_owned();
-    Some(name)
+    // The kernel appends " (deleted)" once the binary is unlinked (a rebuild or a
+    // package upgrade under a running server); the marker is not part of the name.
+    Some(
+        name.strip_suffix(" (deleted)")
+            .map(str::to_string)
+            .unwrap_or(name),
+    )
 }
 
 #[cfg(target_os = "linux")]
