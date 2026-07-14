@@ -85,7 +85,12 @@ fn main() {
     entries.sort_by(|a, b| {
         (a.port, a.proto, a.pid.unwrap_or(0)).cmp(&(b.port, b.proto, b.pid.unwrap_or(0)))
     });
-    entries.dedup_by(|a, b| a.port == b.port && a.proto == b.proto && a.pid == b.pid);
+    // Only dedup rows whose PID is known. `None == None` is not "the same process",
+    // it is "two processes lport cannot see" (root-owned listeners without sudo) —
+    // each row is a distinct socket, and merging them hides a listener.
+    entries.dedup_by(|a, b| {
+        a.port == b.port && a.proto == b.proto && a.pid.is_some() && a.pid == b.pid
+    });
 
     // Info / Kill modes are single-port queries, so filter before the per-PID
     // enrich step. Otherwise `lport info 8080` pays the cost of reading /proc
@@ -385,6 +390,14 @@ fn run_kill(
                     continue;
                 }
             }
+            // The prompt above blocks indefinitely; the process may have exited while
+            // the user was deciding. Signaling a dead PID fails with "No such process",
+            // which would report a failure for a port that is in fact free.
+            if !pid_alive(pid) {
+                outln!(out, "pid {} ({}) already exited.", pid, entry.process);
+                freed_ports.insert(port);
+                continue;
+            }
             let output = Command::new("kill")
                 .args([signal_flag, &pid.to_string()])
                 .output();
@@ -461,6 +474,18 @@ fn run_kill(
             if !prompt_yes_no("Escalate to SIGKILL? [y/N] ") {
                 outln!(out, "skipped escalation for pid {} ({}).", pid, entry.process);
                 any_error = true;
+                continue;
+            }
+            // A slow-but-obedient process can finish shutting down while the escalation
+            // prompt waits — SIGTERM worked, it just took longer than KILL_WAIT_MS.
+            if !pid_alive(pid) {
+                outln!(
+                    out,
+                    "pid {} ({}) exited on its own after SIGTERM.",
+                    pid,
+                    entry.process
+                );
+                freed_ports.insert(port);
                 continue;
             }
             let output = Command::new("kill")
