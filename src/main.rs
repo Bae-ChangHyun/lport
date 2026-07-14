@@ -1003,52 +1003,23 @@ fn parse_ss_line(
 #[cfg(target_os = "linux")]
 fn parse_users(s: &str) -> Vec<(String, u32)> {
     // users field looks like: users:(("name1",pid=123,fd=10),("name2",pid=456,fd=11))
-    // Walk the string, matching each ("<name>",pid=<N>) pair.
+    // Each entry is ("comm",pid=N,fd=M). ss does not escape quotes inside comm, so the
+    // next `"` is not a reliable terminator — the literal `",pid=` sequence is. A comm
+    // containing that sequence itself is unparseable and accepted as such.
     let mut out = Vec::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // find opening quote
-        while i < bytes.len() && bytes[i] != b'"' {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        let name_start = i + 1;
-        i = name_start;
-        while i < bytes.len() && bytes[i] != b'"' {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        let name = &s[name_start..i];
-        i += 1; // past closing quote
-        // find pid= before the next '"' or end
-        let mut scan = i;
-        let mut found_pid: Option<u32> = None;
-        while scan < bytes.len() && bytes[scan] != b'"' {
-            if bytes[scan..].starts_with(b"pid=") {
-                let digits_start = scan + 4;
-                let mut digits_end = digits_start;
-                while digits_end < bytes.len() && bytes[digits_end].is_ascii_digit() {
-                    digits_end += 1;
-                }
-                if digits_end > digits_start {
-                    if let Ok(pid) = s[digits_start..digits_end].parse::<u32>() {
-                        found_pid = Some(pid);
-                    }
-                }
-                break;
-            }
-            scan += 1;
-        }
-        if let Some(pid) = found_pid {
+    let mut rest = s;
+    while let Some(open) = rest.find("(\"") {
+        let after = &rest[open + 2..];
+        let Some(end) = after.find("\",pid=") else { break };
+        let name = &after[..end];
+        let digits = &after[end + 6..];
+        let digits_end = digits
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(digits.len());
+        if let Ok(pid) = digits[..digits_end].parse::<u32>() {
             out.push((name.to_string(), pid));
         }
-        // advance to next candidate: jump to the char after the next '"' (end of this entry)
-        i = scan;
+        rest = &digits[digits_end..];
     }
     out
 }
