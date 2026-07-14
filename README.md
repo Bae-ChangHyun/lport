@@ -130,7 +130,7 @@ BSD `ps` on macOS has no `nlwp` (thread count), so the `THREADS` row is Linux-on
 
 And on both:
 
-- `docker ps` for container/image/compose-project mapping, keyed by `(proto, host-port)` so TCP and UDP on the same port stay distinct. The `com.docker.compose.project` label drives the dashboard grouping; rows fall back to the container name when there is no label.
+- `docker ps` for container/image/compose-project mapping, keyed by `(proto, host-port)` so TCP and UDP on the same port stay distinct, and matched against the listener's bind address so a container published on one host IP does not claim an unrelated listener on the same port. The `com.docker.compose.project` label drives the dashboard grouping; rows fall back to the container name when there is no label.
 - `docker stats --no-stream <name>` (only in `info` mode) for container CPU / MEM
 
 Dashboard runs in ~130 ms on Linux. macOS is slightly slower because it shells out to `lsof` / `ps` instead of reading `/proc`. The `info` and `kill` subcommands filter to the requested port(s) before enriching, so single-port operations do not pay the whole-system cost; Docker adds ~1 s when a container is involved.

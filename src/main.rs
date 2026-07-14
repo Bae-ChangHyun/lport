@@ -33,6 +33,10 @@ struct DockerInfo {
     running_for: String,
     work_dir: Option<String>,
     container_port: u32,
+    // Host address the port is published on ("0.0.0.0", "::", "192.168.1.10").
+    // A container published on one address must not claim a listener bound to a
+    // different one on the same port.
+    host_ip: String,
     // `com.docker.compose.project` label. Used to group sibling containers of
     // the same compose project (e.g. all `supabase_*_helchang` rows) under one
     // visual block.
@@ -58,7 +62,12 @@ enum Mode {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // args_os + lossy: `std::env::args()` panics on non-UTF8 arguments, which is
+    // a crash where an "unknown argument" error is the right answer.
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print_help();
         return;
@@ -637,7 +646,54 @@ fn is_interpreter_exe(name: &str) -> bool {
     )
 }
 
-type DockerMap = HashMap<(&'static str, u32), DockerInfo>;
+// One host (proto, port) can carry several publishes — `-p 127.0.0.1:8080:80`
+// and `-p 192.168.1.10:8080:80` on different containers coexist — so the value
+// is a list and the bind address decides which one owns a given listener.
+type DockerMap = HashMap<(&'static str, u32), Vec<DockerInfo>>;
+
+// Bind address of a socket string: "0.0.0.0:8080" -> "0.0.0.0",
+// "[::]:8080" -> "::", "*:5353" -> "*".
+//
+// `ss` appends a scope/interface to addresses bound to one link ("0.0.0.0%virbr0:67",
+// "[fe80::1%eth0]:8080"). Docker never reports it, so the suffix is dropped —
+// otherwise "0.0.0.0%virbr0" fails the wildcard test and no address ever compares equal.
+fn split_bind_addr(local: &str) -> &str {
+    match local.rfind(':') {
+        Some(i) => {
+            let addr = local[..i].trim_start_matches('[').trim_end_matches(']');
+            addr.split('%').next().unwrap_or(addr)
+        }
+        None => "",
+    }
+}
+
+fn is_wildcard_addr(a: &str) -> bool {
+    matches!(a, "" | "0.0.0.0" | "::" | "*")
+}
+
+// A socket bound to a v4-mapped v6 address is reported as "::ffff:127.0.0.1"
+// while docker reports the plain "127.0.0.1"; compare them on equal terms.
+fn normalize_addr(a: &str) -> &str {
+    a.strip_prefix("::ffff:").unwrap_or(a)
+}
+
+fn ip_matches(docker_ip: &str, local_addr: &str) -> bool {
+    is_wildcard_addr(docker_ip)
+        || is_wildcard_addr(local_addr)
+        || normalize_addr(docker_ip) == normalize_addr(local_addr)
+}
+
+fn docker_lookup(
+    map: &DockerMap,
+    proto: &'static str,
+    port: u32,
+    local_addr: &str,
+) -> Option<DockerInfo> {
+    map.get(&(proto, port))?
+        .iter()
+        .find(|d| ip_matches(&d.host_ip, local_addr))
+        .cloned()
+}
 
 fn load_docker_ports() -> DockerMap {
     let mut map: DockerMap = HashMap::new();
@@ -684,6 +740,7 @@ fn load_docker_ports() -> DockerMap {
             };
             let Some(colon) = left.rfind(':') else { continue };
             let port_str = &left[colon + 1..];
+            let host_ip = split_bind_addr(left);
             let (start, end) = match parse_port_range(port_str) {
                 Some(r) => r,
                 None => continue,
@@ -691,17 +748,15 @@ fn load_docker_ports() -> DockerMap {
             let (cstart, _cend) = parse_port_range(cport_str).unwrap_or((start, end));
             for (i, p) in (start..=end).enumerate() {
                 let cp = cstart + i as u32;
-                map.insert(
-                    (proto, p),
-                    DockerInfo {
-                        name: name.to_string(),
-                        image: image.clone(),
-                        running_for: running_for.clone(),
-                        work_dir: work_dir.clone(),
-                        container_port: cp,
-                        compose_project: compose_project.clone(),
-                    },
-                );
+                map.entry((proto, p)).or_default().push(DockerInfo {
+                    name: name.to_string(),
+                    image: image.clone(),
+                    running_for: running_for.clone(),
+                    work_dir: work_dir.clone(),
+                    container_port: cp,
+                    host_ip: host_ip.to_string(),
+                    compose_project: compose_project.clone(),
+                });
             }
         }
     }
@@ -745,6 +800,22 @@ fn collect_ss(
             std::process::exit(1);
         }
     };
+    // busybox `ss` does not support `-H` and exits non-zero instead of printing
+    // rows. Parsing its empty stdout would report "no listening ports" — a wrong
+    // answer that looks like a right one.
+    if !output.status.success() {
+        eprintln!(
+            "error: `ss {}` failed (exit {}): {}",
+            args.join(" "),
+            output
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "?".into()),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        std::process::exit(1);
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         parse_ss_line(line, proto, docker_map, out);
@@ -771,7 +842,7 @@ fn parse_ss_line(
         return;
     };
 
-    let docker = docker_map.get(&(proto, port)).cloned();
+    let docker = docker_lookup(docker_map, proto, port, split_bind_addr(local));
 
     // `users:(...)` is the trailing column. Locate it in the raw line instead
     // of in whitespace-split tokens, because the process name inside the
@@ -966,7 +1037,7 @@ fn flush_lsof(
     if port == 0 {
         return;
     }
-    let docker = docker_map.get(&(proto, port)).cloned();
+    let docker = docker_lookup(docker_map, proto, port, split_bind_addr(name_first));
     out.push(Entry {
         proto,
         port,
@@ -1556,6 +1627,32 @@ fn spawn_update_cache_refresh(cache_path: &std::path::Path) {
         .spawn();
 }
 
+// Terminal cells occupied by `s`. The wide set below is an approximation of the
+// East Asian Wide/Fullwidth ranges (plus common emoji blocks), not a full
+// UAX #11 table — enough to keep columns aligned for the paths, process names
+// and container names lport prints.
+fn display_width(s: &str) -> usize {
+    s.chars().map(|c| if is_wide_char(c) { 2 } else { 1 }).sum()
+}
+
+fn is_wide_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x1100..=0x115F
+            | 0x2E80..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE19
+            | 0xFE30..=0xFE6F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1F64F
+            | 0x1F900..=0x1F9FF
+            | 0x20000..=0x2FFFD
+            | 0x30000..=0x3FFFD
+    )
+}
+
 fn nz(s: &str) -> String {
     if s.is_empty() {
         "-".to_string()
@@ -1677,18 +1774,20 @@ fn print_table(entries: &[Entry], dev_mode: bool) {
         })
         .collect();
 
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    let mut widths: Vec<usize> = headers.iter().map(|h| display_width(h)).collect();
     for row in &rows {
         for (i, cell) in row.iter().enumerate() {
-            widths[i] = widths[i].max(cell.chars().count());
+            widths[i] = widths[i].max(display_width(cell));
         }
     }
 
+    // `{:<width$}` pads by char count, which under-pads CJK cells (a Hangul path
+    // component occupies two terminal cells per char). Pad by display width.
     let fmt_row = |cells: &[String]| -> String {
         cells
             .iter()
             .zip(&widths)
-            .map(|(c, w)| format!("{:<width$}", c, width = *w))
+            .map(|(c, w)| format!("{}{}", c, " ".repeat(w.saturating_sub(display_width(c)))))
             .collect::<Vec<_>>()
             .join("  ")
     };
