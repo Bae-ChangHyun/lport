@@ -352,6 +352,10 @@ fn run_kill(
     // Ports whose owner was confirmed dead — the only ones worth re-scanning for
     // a supervisor-spawned replacement.
     let mut freed_ports: HashSet<u32> = HashSet::new();
+    // PIDs confirmed dead. A PID holding several of the requested ports is signaled once,
+    // so the later ports never reach a `freed_ports.insert` of their own — but they were
+    // freed too, and a supervisor can take any of them back.
+    let mut dead: HashSet<u32> = HashSet::new();
 
     for &port in ports {
         let matches: Vec<&Entry> = entries.iter().filter(|e| e.port == port).collect();
@@ -386,6 +390,11 @@ fn run_kill(
                 continue;
             };
             if signaled.contains(&pid) {
+                // Same PID, another requested port: it was freed by the same signal, so it
+                // belongs in the restart re-scan even though nothing was signaled here.
+                if dead.contains(&pid) {
+                    freed_ports.insert(port);
+                }
                 outln_soft!(
                     out,
                     "pid {} already handled (also listens on {}/{}).",
@@ -446,6 +455,7 @@ fn run_kill(
                 signaled.insert(pid);
                 outln_soft!(out, "pid {} ({}) already exited.", pid, entry.process);
                 freed_ports.insert(port);
+                dead.insert(pid);
                 continue;
             }
             signaled.insert(pid);
@@ -495,6 +505,7 @@ fn run_kill(
                     signal_name
                 );
                 freed_ports.insert(port);
+                dead.insert(pid);
                 continue;
             }
 
@@ -541,6 +552,7 @@ fn run_kill(
                     entry.process
                 );
                 freed_ports.insert(port);
+                dead.insert(pid);
                 continue;
             }
             let output = Command::new("kill")
@@ -583,6 +595,7 @@ fn run_kill(
                     port
                 );
                 freed_ports.insert(port);
+                dead.insert(pid);
             } else {
                 outln_soft!(
                     err,
@@ -1462,19 +1475,48 @@ fn enrich_docker_stats(entries: &mut [Entry], include_cpu_mem: bool) {
     if names.is_empty() {
         return;
     }
-    let mut cmd = Command::new("docker");
-    cmd.args([
-        "stats",
-        "--no-stream",
-        "--format",
-        "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}",
-    ]);
-    for n in &names {
-        cmd.arg(n);
-    }
-    let output = match cmd.output() {
-        Ok(o) if o.status.success() => o,
-        _ => return,
+    let run_stats = |names: &[String]| {
+        let mut cmd = Command::new("docker");
+        cmd.args([
+            "stats",
+            "--no-stream",
+            "--format",
+            "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}",
+        ]);
+        for n in names {
+            cmd.arg(n);
+        }
+        match cmd.output() {
+            Ok(o) if o.status.success() => Some(o),
+            _ => None,
+        }
+    };
+    // `docker stats` fails as a batch — exit 1, empty stdout — when any name in it is
+    // already gone, which is a live possibility in the second between our `docker ps`
+    // and this call. Losing CPU/MEM for every container because one died is worse than
+    // one extra `docker ps`, so retry once with the names that are still up.
+    let output = match run_stats(&names) {
+        Some(o) => o,
+        None => {
+            let live: HashSet<String> = match Command::new("docker")
+                .args(["ps", "--format", "{{.Names}}"])
+                .output()
+            {
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect(),
+                _ => return,
+            };
+            let still_up: Vec<String> = names.into_iter().filter(|n| live.contains(n)).collect();
+            if still_up.is_empty() {
+                return;
+            }
+            match run_stats(&still_up) {
+                Some(o) => o,
+                None => return,
+            }
+        }
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut map: HashMap<String, (String, String)> = HashMap::new();
@@ -1741,9 +1783,9 @@ fn spawn_update_cache_refresh(cache_path: &std::path::Path) {
 }
 
 // Terminal cells occupied by `s`. The wide set below is an approximation of the
-// East Asian Wide/Fullwidth ranges (plus common emoji blocks), not a full
-// UAX #11 table — enough to keep columns aligned for the paths, process names
-// and container names lport prints.
+// East Asian Wide/Fullwidth ranges (plus the emoji blocks and the Emoji_Presentation
+// defaults), not a full UAX #11 table — enough to keep columns aligned for the paths,
+// process names and container names lport prints.
 fn display_width(s: &str) -> usize {
     s.chars().map(|c| if is_wide_char(c) { 2 } else { 1 }).sum()
 }
@@ -1760,9 +1802,47 @@ fn is_wide_char(c: char) -> bool {
             | 0xFF00..=0xFF60
             | 0xFFE0..=0xFFE6
             | 0x1F300..=0x1F64F
+            | 0x1F680..=0x1F6FF
+            | 0x1F7E0..=0x1F7EB
             | 0x1F900..=0x1F9FF
+            | 0x1FA70..=0x1FAFF
             | 0x20000..=0x2FFFD
             | 0x30000..=0x3FFFD
+            // Emoji_Presentation defaults scattered through U+2xxx: listed one by one
+            // because their neighbours (☑ ⚠ …) default to text presentation and stay narrow.
+            | 0x231A..=0x231B
+            | 0x23E9..=0x23EC
+            | 0x23F0
+            | 0x23F3
+            | 0x25FD..=0x25FE
+            | 0x2614..=0x2615
+            | 0x2648..=0x2653
+            | 0x267F
+            | 0x2693
+            | 0x26A1
+            | 0x26AA..=0x26AB
+            | 0x26BD..=0x26BE
+            | 0x26C4..=0x26C5
+            | 0x26CE
+            | 0x26D4
+            | 0x26EA
+            | 0x26F2..=0x26F3
+            | 0x26F5
+            | 0x26FA
+            | 0x26FD
+            | 0x2705
+            | 0x270A..=0x270B
+            | 0x2728
+            | 0x274C
+            | 0x274E
+            | 0x2753..=0x2755
+            | 0x2757
+            | 0x2795..=0x2797
+            | 0x27B0
+            | 0x27BF
+            | 0x2B1B..=0x2B1C
+            | 0x2B50
+            | 0x2B55
     )
 }
 
