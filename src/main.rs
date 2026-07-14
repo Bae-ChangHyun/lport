@@ -88,8 +88,20 @@ fn main() {
     // Only dedup rows whose PID is known. `None == None` is not "the same process",
     // it is "two processes lport cannot see" (root-owned listeners without sudo) —
     // each row is a distinct socket, and merging them hides a listener.
+    //
+    // Docker rows are the exception: a container published on both stacks (docker's
+    // default: `0.0.0.0:P` + `[::]:P`) yields two listeners carrying identical
+    // container information, differing only in a bind address lport does not print
+    // and a docker-proxy PID visible under sudo. Merging them by container identity
+    // hides nothing, and docker rows are never kill targets.
     entries.dedup_by(|a, b| {
-        a.port == b.port && a.proto == b.proto && a.pid.is_some() && a.pid == b.pid
+        if a.port != b.port || a.proto != b.proto {
+            return false;
+        }
+        if let (Some(da), Some(db)) = (&a.docker, &b.docker) {
+            return da.name == db.name && da.container_port == db.container_port;
+        }
+        a.pid.is_some() && a.pid == b.pid
     });
 
     // Info / Kill modes are single-port queries, so filter before the per-PID
@@ -587,14 +599,14 @@ fn warn_on_restart(
 }
 
 fn parse_mode(args: &[String]) -> Mode {
-    if let Some(idx) = args.iter().position(|a| a == "info") {
-        // Nothing else belongs before `info`; it is its own subcommand.
-        if let Some(unknown) = args[..idx].first() {
-            eprintln!("error: unknown argument '{}'", unknown);
-            std::process::exit(2);
-        }
+    // A subcommand is only a subcommand in first position. Matching it anywhere
+    // turns `lport kill 8080 info` into "unknown argument 'kill'" instead of the
+    // real complaint, which is the stray `info`.
+    let subcommand = args.first().map(String::as_str);
+
+    if subcommand == Some("info") {
         let mut ports: Vec<u32> = Vec::new();
-        for a in &args[idx + 1..] {
+        for a in &args[1..] {
             match a.parse::<u32>() {
                 Ok(p) if (1..=65535).contains(&p) => ports.push(p),
                 _ => {
@@ -610,15 +622,11 @@ fn parse_mode(args: &[String]) -> Mode {
         return Mode::Info { ports };
     }
 
-    if let Some(idx) = args.iter().position(|a| a == "kill") {
-        if let Some(unknown) = args[..idx].first() {
-            eprintln!("error: unknown argument '{}'", unknown);
-            std::process::exit(2);
-        }
+    if subcommand == Some("kill") {
         let mut ports: Vec<u32> = Vec::new();
         let mut force = false;
         let mut yes = false;
-        for a in &args[idx + 1..] {
+        for a in &args[1..] {
             match a.as_str() {
                 "-9" | "--force" => force = true,
                 "-y" | "--yes" => yes = true,
