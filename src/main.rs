@@ -1176,16 +1176,21 @@ fn parse_users(s: &str) -> Vec<(String, u32)> {
 
 // `_strict` is unused on macOS: `lsof` exits non-zero when nothing matches, which is
 // normal, so this path never exits on a non-zero status to begin with.
+//
+// The `f` (fd) field is requested not for its value but as a per-socket delimiter: the
+// state machine flushes one Entry per `f` record. lsof 4.94+ (the lsof-org fork, what
+// Homebrew ships) only emits fields named in `-F`, so `f` must be listed explicitly —
+// without it every listener is silently dropped.
 #[cfg(target_os = "macos")]
 fn collect_listening(docker_map: &DockerMap, _strict: bool) -> Vec<Entry> {
     let mut entries = Vec::new();
     collect_lsof(
         "tcp",
-        &["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"],
+        &["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcnf"],
         docker_map,
         &mut entries,
     );
-    collect_lsof("udp", &["-nP", "-iUDP", "-Fpcn"], docker_map, &mut entries);
+    collect_lsof("udp", &["-nP", "-iUDP", "-Fpcnf"], docker_map, &mut entries);
     entries
 }
 
