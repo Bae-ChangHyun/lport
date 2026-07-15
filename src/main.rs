@@ -57,8 +57,15 @@ struct Entry {
     port: u32,
     pid: Option<u32>,
     process: String,
+    // Bind address for display, scope suffix kept ("127.0.0.1", "::", "*",
+    // "0.0.0.0%virbr0"). Distinct from the match key in `split_bind_addr`, which
+    // strips the scope.
+    addr: String,
     cwd: String,
     cmdline: String,
+    // Parent (ppid, cmdline). Filled only in info mode — see enrich_parent_info —
+    // so the dashboard and kill paths pay nothing for it.
+    parent: Option<(u32, String)>,
     docker: Option<DockerInfo>,
     stats: Stats,
     user_launched: bool,
@@ -152,6 +159,7 @@ fn main() {
 
     match mode {
         Mode::Info { ports } => {
+            enrich_parent_info(&mut entries);
             let code = print_info(&entries, &ports);
             maybe_print_update_notice();
             std::process::exit(code);
@@ -167,12 +175,14 @@ fn main() {
 
 fn print_help() {
     println!("Usage: lport [--dev]");
+    println!("       lport PORT [PORT ...]");
     println!("       lport info PORT [PORT ...]");
     println!("       lport kill PORT [PORT ...] [-9|--force] [-y|--yes]");
     println!();
     println!("  (default)        Show user-launched servers and Docker containers only");
     println!("                   (PROTO PORT PID PROCESS JOB CPU MEM UPTIME)");
     println!("  --dev            Show every listening port, including system daemons");
+    println!("  PORT...          Shorthand for `lport info PORT...`");
     println!("  info PORT...     Show full details for the given port(s),");
     println!("                   including Docker container CPU/MEM");
     println!("                   example: lport info 8080 5432");
@@ -182,8 +192,9 @@ fn print_help() {
     println!("                   Pass -y / --yes to skip the prompt (non-interactive).");
     println!("                   Verifies the process actually exited; offers SIGKILL");
     println!("                   escalation if it survives SIGTERM.");
-    println!("                   Docker-backed ports are not killed; lport prints the");
-    println!("                   matching `docker stop` command instead.");
+    println!("                   Docker-backed ports are not killed; lport offers");
+    println!("                   `docker stop` interactively (or prints the command");
+    println!("                   when non-interactive).");
     println!("                   example: lport kill 3000 8080");
     println!("  -V, --version    Print version and exit");
     println!("  -h, --help       Print this help and exit");
@@ -361,6 +372,10 @@ fn run_kill(
     // so the later ports never reach a `freed_ports.insert` of their own — but they were
     // freed too, and a supervisor can take any of them back.
     let mut dead: HashSet<u32> = HashSet::new();
+    // Containers already `docker stop`ped / skipped this run: the same container can back
+    // several requested ports (or tcp+udp), and each decision is made once.
+    let mut stopped_containers: HashSet<String> = HashSet::new();
+    let mut skipped_containers: HashSet<String> = HashSet::new();
 
     for &port in ports {
         let matches: Vec<&Entry> = entries.iter().filter(|e| e.port == port).collect();
@@ -372,15 +387,94 @@ fn run_kill(
 
         for entry in &matches {
             if let Some(d) = &entry.docker {
-                outln_soft!(
-                    err,
-                    "port {}/{}: owned by Docker container '{}'. Use: docker stop {}",
-                    entry.proto,
-                    port,
-                    d.name,
-                    d.name
-                );
-                any_error = true;
+                if stopped_containers.contains(&d.name) {
+                    outln_soft!(out, "container '{}' already stopped.", d.name);
+                    continue;
+                }
+                if skipped_containers.contains(&d.name) {
+                    outln_soft!(out, "skipped container '{}' earlier.", d.name);
+                    continue;
+                }
+                // A container is not killed like a process — stopping it is a container
+                // lifecycle action. Offer it interactively; `-y` deliberately does NOT
+                // auto-stop containers, since a script clearing a port should not tear
+                // down a container as a side effect.
+                let interactive = !yes && io::stdin().is_terminal();
+                if !interactive {
+                    outln_soft!(
+                        err,
+                        "port {}/{}: owned by Docker container '{}'. Use: docker stop {}",
+                        entry.proto,
+                        port,
+                        d.name,
+                        d.name
+                    );
+                    any_error = true;
+                    continue;
+                }
+                match prompt_yes_no(&format!(
+                    "port {}/{} is owned by Docker container '{}'. Stop the container? [y/N] ",
+                    entry.proto, port, d.name
+                )) {
+                    Some(true) => {
+                        match Command::new("docker").args(["stop", &d.name]).output() {
+                            Ok(o) if o.status.success() => {
+                                stopped_containers.insert(d.name.clone());
+                                outln_soft!(
+                                    out,
+                                    "stopped container '{}' ({}/{}).",
+                                    d.name,
+                                    entry.proto,
+                                    port
+                                );
+                            }
+                            Ok(o) => {
+                                outln_soft!(
+                                    err,
+                                    "port {}/{}: `docker stop {}` exited with status {}.",
+                                    entry.proto,
+                                    port,
+                                    d.name,
+                                    o.status
+                                        .code()
+                                        .map(|c| c.to_string())
+                                        .unwrap_or_else(|| "?".into())
+                                );
+                                let detail = String::from_utf8_lossy(&o.stderr);
+                                let detail = detail.trim();
+                                if !detail.is_empty() {
+                                    outln_soft!(err, "  {}", detail);
+                                }
+                                any_error = true;
+                            }
+                            Err(e) => {
+                                outln_soft!(
+                                    err,
+                                    "port {}/{}: failed to spawn `docker`: {}.",
+                                    entry.proto,
+                                    port,
+                                    e
+                                );
+                                any_error = true;
+                            }
+                        }
+                    }
+                    Some(false) => {
+                        skipped_containers.insert(d.name.clone());
+                        outln_soft!(out, "skipped container '{}'. Use: docker stop {}", d.name, d.name);
+                    }
+                    None => {
+                        outln_soft!(
+                            err,
+                            "port {}/{}: owned by Docker container '{}'. Use: docker stop {}",
+                            entry.proto,
+                            port,
+                            d.name,
+                            d.name
+                        );
+                        any_error = true;
+                    }
+                }
                 continue;
             }
             let Some(pid) = entry.pid else {
@@ -674,9 +768,18 @@ fn parse_mode(args: &[String]) -> Mode {
     // real complaint, which is the stray `info`.
     let subcommand = args.first().map(String::as_str);
 
-    if subcommand == Some("info") {
+    // `lport 8080` is shorthand for `lport info 8080`: if the first argument is a
+    // port number, treat every argument as a port. `--dev` / `info` / `kill` still
+    // win because they do not parse as a port.
+    let shorthand_info = args
+        .first()
+        .and_then(|a| a.parse::<u32>().ok())
+        .is_some_and(|p| (1..=65535).contains(&p));
+
+    if subcommand == Some("info") || shorthand_info {
+        let port_args = if shorthand_info { &args[..] } else { &args[1..] };
         let mut ports: Vec<u32> = Vec::new();
-        for a in &args[1..] {
+        for a in port_args {
             match a.parse::<u32>() {
                 Ok(p) if (1..=65535).contains(&p) => ports.push(p),
                 _ => {
@@ -776,6 +879,15 @@ fn split_bind_addr(local: &str) -> &str {
             let addr = local[..i].trim_start_matches('[').trim_end_matches(']');
             addr.split('%').next().unwrap_or(addr)
         }
+        None => "",
+    }
+}
+
+// Bind address for display: like `split_bind_addr` but keeps the `%scope` suffix,
+// since which interface a socket is bound to is information the user wants to see.
+fn display_bind_addr(local: &str) -> &str {
+    match local.rfind(':') {
+        Some(i) => local[..i].trim_start_matches('[').trim_end_matches(']'),
         None => "",
     }
 }
@@ -970,6 +1082,7 @@ fn parse_ss_line(
     };
 
     let docker = docker_lookup(docker_map, proto, port, split_bind_addr(local));
+    let addr = display_bind_addr(local).to_string();
 
     // `users:(...)` is the trailing column. Locate it in the raw line instead
     // of in whitespace-split tokens, because the process name inside the
@@ -987,8 +1100,10 @@ fn parse_ss_line(
             port,
             pid: None,
             process: "?".to_string(),
+            addr,
             cwd: String::new(),
             cmdline: String::new(),
+            parent: None,
             docker,
             stats: Stats::default(),
             user_launched: false,
@@ -1002,8 +1117,10 @@ fn parse_ss_line(
             port,
             pid: Some(pid),
             process: name,
+            addr: addr.clone(),
             cwd: String::new(),
             cmdline: String::new(),
+            parent: None,
             docker: docker.clone(),
             stats: Stats::default(),
             user_launched: false,
@@ -1143,8 +1260,10 @@ fn flush_lsof(
         port,
         pid,
         process: cmd.to_string(),
+        addr: display_bind_addr(name_first).to_string(),
         cwd: String::new(),
         cmdline: String::new(),
+        parent: None,
         docker,
         stats: Stats::default(),
         user_launched: false,
@@ -1257,6 +1376,117 @@ fn read_user_launched_proc(pid: u32) -> bool {
         .as_deref()
         .map(is_interpreter_exe)
         .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn read_ppid_proc(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // comm can contain spaces/parens, so start after the last ')': state(0) ppid(1) ...
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(1)?.parse::<u32>().ok()
+}
+
+// (ppid, parent's cmdline). Reads /proc directly; only called in info mode.
+#[cfg(target_os = "linux")]
+fn read_parent_info(pid: u32) -> Option<(u32, String)> {
+    let ppid = read_ppid_proc(pid)?;
+    let cmd = read_cmdline_proc(ppid);
+    // cmdline is empty for kernel threads and unreadable across privilege boundaries;
+    // comm is a usable fallback in both cases.
+    let cmd = if matches!(cmd.as_str(), "-" | "?") {
+        fs::read_to_string(format!("/proc/{}/comm", ppid))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(cmd)
+    } else {
+        cmd
+    };
+    Some((ppid, cmd))
+}
+
+#[cfg(target_os = "linux")]
+fn enrich_parent_info(entries: &mut [Entry]) {
+    let pids: HashSet<u32> = entries.iter().filter_map(|e| e.pid).collect();
+    let mut info: HashMap<u32, (u32, String)> = HashMap::with_capacity(pids.len());
+    for pid in &pids {
+        if let Some(p) = read_parent_info(*pid) {
+            info.insert(*pid, p);
+        }
+    }
+    for e in entries.iter_mut() {
+        if let Some(pid) = e.pid {
+            e.parent = info.get(&pid).cloned();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn enrich_parent_info(entries: &mut [Entry]) {
+    let pids: HashSet<u32> = entries.iter().filter_map(|e| e.pid).collect();
+    if pids.is_empty() {
+        return;
+    }
+    let pid_list = pids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+
+    // pid -> ppid
+    let mut ppid_of: HashMap<u32, u32> = HashMap::new();
+    if let Ok(output) = Command::new("ps")
+        .args(["-o", "pid=,ppid=", "-p", &pid_list])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&output.stdout);
+        for line in s.lines() {
+            let mut it = line.split_whitespace();
+            if let (Some(p), Some(pp)) = (it.next(), it.next()) {
+                if let (Ok(p), Ok(pp)) = (p.parse::<u32>(), pp.parse::<u32>()) {
+                    ppid_of.insert(p, pp);
+                }
+            }
+        }
+    }
+    if ppid_of.is_empty() {
+        return;
+    }
+
+    // ppid -> command line
+    let ppid_list = ppid_of
+        .values()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut cmd_of: HashMap<u32, String> = HashMap::new();
+    if let Ok(output) = Command::new("ps")
+        .args(["-ww", "-o", "pid=,command=", "-p", &ppid_list])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&output.stdout);
+        for line in s.lines() {
+            let trimmed = line.trim_start();
+            let Some(sp) = trimmed.find(char::is_whitespace) else {
+                continue;
+            };
+            let (pid_s, rest) = trimmed.split_at(sp);
+            if let Ok(pp) = pid_s.parse::<u32>() {
+                cmd_of.insert(pp, rest.trim().to_string());
+            }
+        }
+    }
+
+    for e in entries.iter_mut() {
+        if let Some(pid) = e.pid {
+            if let Some(&ppid) = ppid_of.get(&pid) {
+                let cmd = cmd_of
+                    .get(&ppid)
+                    .filter(|c| !c.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| "?".to_string());
+                e.parent = Some((ppid, cmd));
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1892,6 +2122,7 @@ fn print_info(entries: &[Entry], ports: &[u32]) -> i32 {
 fn local_info_rows(e: &Entry) -> Vec<(&'static str, String)> {
     let mut rows: Vec<(&'static str, String)> = vec![
         ("PORT", format!("{}/{}", e.proto, e.port)),
+        ("ADDR", nz(&e.addr)),
         ("PROCESS", e.process.clone()),
         (
             "PID",
@@ -1907,6 +2138,9 @@ fn local_info_rows(e: &Entry) -> Vec<(&'static str, String)> {
         rows.push(("THREADS", t.to_string()));
     }
     rows.push(("UPTIME", nz(&e.stats.uptime)));
+    if let Some((ppid, cmd)) = &e.parent {
+        rows.push(("PARENT", format!("pid {} ({})", ppid, cmd)));
+    }
     rows.push(("CWD", e.cwd.clone()));
     rows.push(("CMD", e.cmdline.clone()));
     rows
@@ -1918,6 +2152,7 @@ fn docker_info_rows(e: &Entry, d: &DockerInfo) -> Vec<(&'static str, String)> {
             "PORT",
             format!("{}/{} → {} (in container)", e.proto, e.port, d.container_port),
         ),
+        ("ADDR", nz(&e.addr)),
         ("TYPE", "docker container".to_string()),
         ("CONTAINER", d.name.clone()),
         ("IMAGE", d.image.clone()),

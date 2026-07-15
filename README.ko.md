@@ -57,6 +57,7 @@ cargo install --git https://github.com/Bae-ChangHyun/lport
 ```bash
 lport                    # 대시보드: 사용자 서버 + docker 컨테이너
 lport --dev              # 전부 (시스템 데몬 포함)
+lport 8080               # `lport info 8080` 단축
 lport info 8080          # 단일 포트 상세 블록
 lport info 8080 5432     # 여러 포트
 lport kill 3000          # 3000 포트의 프로세스에 SIGTERM
@@ -79,7 +80,7 @@ sudo lport               # 다른 사용자 프로세스까지 완전한 가시�
   <img src="demo/info.gif" alt="lport info" width="780"/>
 </p>
 
-`lport info PORT...`는 요청한 포트로 먼저 필터링한 뒤 PID별 상태를 읽으므로 단일 포트 조회가 가볍습니다. 블록에는 사용자, CPU, MEM, 스레드 수(Linux), 가동 시간, 작업 디렉터리, 전체 커맨드라인이 표시됩니다. Docker 포트라면 컨테이너 이름, 이미지, compose 작업 디렉터리, 실시간 `docker stats` CPU / MEM이 추가됩니다. 요청한 포트 중 리스너가 없는 포트는 개별적으로 보고됩니다(`port N: no listening process found.`).
+`lport info PORT...`(또는 그냥 `lport PORT...`)는 요청한 포트로 먼저 필터링한 뒤 PID별 상태를 읽으므로 단일 포트 조회가 가볍습니다. 블록에는 바인드 주소(`ADDR`), 부모 프로세스(`PARENT` — 슈퍼바이저가 포트를 계속 되살릴 때 부모를 종료할 수 있게), 사용자, CPU, MEM, 스레드 수(Linux), 가동 시간, 작업 디렉터리, 전체 커맨드라인이 표시됩니다. Docker 포트라면 컨테이너 이름, 이미지, compose 작업 디렉터리, 실시간 `docker stats` CPU / MEM이 추가됩니다. 요청한 포트 중 리스너가 없는 포트는 개별적으로 보고됩니다(`port N: no listening process found.`).
 
 ### 포트 종료
 
@@ -95,11 +96,12 @@ sudo lport               # 다른 사용자 프로세스까지 완전한 가시�
 - **바로 되살아난다면?** 죽인 포트가 잠시 후 다시 리스닝을 시작하면, 슈퍼바이저(dev 서버, systemd)가 재시작했을 가능성이 높다고 경고합니다 — 부모를 종료하세요.
 - **권한이 없다면?** `kill`의 진단 메시지를 그대로 보여주고, EPERM이면 `sudo lport kill PORT`를 안내합니다.
 
-Docker 포트는 **죽이지 않습니다** — 대신 해당하는 `docker stop <name>` 명령을 출력합니다. 컨테이너 수명 관리는 `lport`의 범위 밖입니다.
+Docker 포트에는 시그널을 보내지 않습니다. 대화형 터미널에서는 대신 컨테이너를 중지할지 제안하며(`Stop the container? [y/N]`), 거절하면 정상 종료(`0`)입니다. 비대화형일 때 — 파이프로 연결됐거나 `-y`를 줬을 때 — 는 컨테이너를 부수는 부작용 대신 해당하는 `docker stop <name>` 명령을 출력하고 `1`로 종료합니다.
 
 ```
 $ lport kill 5432
-port tcp/5432: owned by Docker container 'supabase_db_supabase-prod'. Use: docker stop supabase_db_supabase-prod
+port tcp/5432 is owned by Docker container 'supabase_db_supabase-prod'. Stop the container? [y/N] y
+stopped container 'supabase_db_supabase-prod' (tcp/5432).
 ```
 
 ### Exit codes
@@ -107,8 +109,8 @@ port tcp/5432: owned by Docker container 'supabase_db_supabase-prod'. Use: docke
 | 명령 | `0` | `1` | `2` |
 | --- | --- | --- | --- |
 | `lport` / `--dev` | 항상 (출력이 비어도) | — | 알 수 없는 인자 |
-| `lport info` | 요청한 포트 전부 발견 | 요청한 포트 중 리스너 없는 것이 있음 | 인자 오류 |
-| `lport kill` | 모든 대상의 종료 확인 (또는 사용자가 스킵) | 리스너 없음 / Docker 포트 / 시그널 실패 / 생존 | 인자 오류 |
+| `lport info` (또는 `lport PORT`) | 요청한 포트 전부 발견 | 요청한 포트 중 리스너 없는 것이 있음 | 인자 오류 |
+| `lport kill` | 모든 대상의 종료 확인, 사용자가 스킵, 또는 대화형으로 거절한 컨테이너 | 리스너 없음 / 시그널 실패 / 생존 / 비대화형에서 그대로 둔 Docker 포트 | 인자 오류 |
 
 Exit code는 파이프가 닫혀도 유지됩니다: `lport kill -y 3000 8080 | head -1`도 두 포트 모두 시그널을 보내고 정직하게 보고합니다.
 

@@ -57,6 +57,7 @@ cargo install --git https://github.com/Bae-ChangHyun/lport
 ```bash
 lport                    # dashboard: user servers + docker containers
 lport --dev              # everything (system daemons included)
+lport 8080               # shorthand for `lport info 8080`
 lport info 8080          # detail block for a single port
 lport info 8080 5432     # multiple ports
 lport kill 3000          # SIGTERM the process(es) listening on port 3000
@@ -79,7 +80,7 @@ The default view groups Docker containers by their `com.docker.compose.project` 
   <img src="demo/info.gif" alt="lport info" width="780"/>
 </p>
 
-`lport info PORT...` filters to the requested ports before reading per-PID state, so a single-port query stays cheap. The block surfaces user, CPU, MEM, threads (Linux), uptime, working directory, and the full command line. For Docker-backed ports, it adds container name, image, compose working directory, and live `docker stats` CPU / MEM. Each requested port with no listener is reported individually (`port N: no listening process found.`).
+`lport info PORT...` (or just `lport PORT...`) filters to the requested ports before reading per-PID state, so a single-port query stays cheap. The block surfaces the bind address (`ADDR`), the parent process (`PARENT`, so you can kill the parent when a supervisor keeps reviving a port), user, CPU, MEM, threads (Linux), uptime, working directory, and the full command line. For Docker-backed ports, it adds container name, image, compose working directory, and live `docker stats` CPU / MEM. Each requested port with no listener is reported individually (`port N: no listening process found.`).
 
 ### Killing a port
 
@@ -95,11 +96,12 @@ Sending a signal is not the same as the process obeying it, so `lport` waits up 
 - **Restarted immediately?** When a killed port starts listening again moments later, `lport` warns that a supervisor (dev server, systemd) most likely restarted it — kill the parent instead.
 - **No permission?** Failures surface the `kill` diagnostic and hint `sudo lport kill PORT` on EPERM.
 
-Docker-backed ports are **not** killed — `lport` prints the matching `docker stop <name>` command instead. Container lifecycle is outside `lport`'s scope.
+Docker-backed ports are **not** signaled. On an interactive terminal `lport` offers to stop the container instead (`Stop the container? [y/N]`); declining is a clean exit `0`. When non-interactive — piped, or with `-y` — it prints the matching `docker stop <name>` command and exits `1` rather than tearing a container down as a side effect.
 
 ```
 $ lport kill 5432
-port tcp/5432: owned by Docker container 'supabase_db_supabase-prod'. Use: docker stop supabase_db_supabase-prod
+port tcp/5432 is owned by Docker container 'supabase_db_supabase-prod'. Stop the container? [y/N] y
+stopped container 'supabase_db_supabase-prod' (tcp/5432).
 ```
 
 ### Exit codes
@@ -107,8 +109,8 @@ port tcp/5432: owned by Docker container 'supabase_db_supabase-prod'. Use: docke
 | Command | `0` | `1` | `2` |
 | --- | --- | --- | --- |
 | `lport` / `--dev` | always (even on empty output) | — | unknown argument |
-| `lport info` | every requested port found | any requested port had no listener | argument error |
-| `lport kill` | every target confirmed dead (or skipped by you) | no listener / Docker-backed / signal failed / survived | argument error |
+| `lport info` (or `lport PORT`) | every requested port found | any requested port had no listener | argument error |
+| `lport kill` | every target confirmed dead, skipped by you, or an interactively-declined container | no listener / signal failed / survived / a Docker-backed port left running non-interactively | argument error |
 
 Exit codes survive closed pipes: `lport kill -y 3000 8080 | head -1` still signals both ports and reports honestly.
 
