@@ -80,7 +80,7 @@ The default view groups Docker containers by their `com.docker.compose.project` 
   <img src="demo/info.gif" alt="lport info" width="780"/>
 </p>
 
-`lport info PORT...` (or just `lport PORT...`) filters to the requested ports before reading per-PID state, so a single-port query stays cheap. The block surfaces the bind address (`ADDR`), the parent process (`PARENT`, so you can kill the parent when a supervisor keeps reviving a port), user, CPU, MEM, threads (Linux), uptime, working directory, and the full command line. For Docker-backed ports, it adds container name, image, compose working directory, and live `docker stats` CPU / MEM. Each requested port with no listener is reported individually (`port N: no listening process found.`).
+`lport info PORT...` (or just `lport PORT...`) filters to the requested ports before reading per-PID state, so a single-port query stays cheap. The block surfaces the bind address (`ADDR`; a process bound to several addresses on one port lists them comma-separated, so `127.0.0.1, ::` reads as loopback plus all interfaces), the parent process (`PARENT`, so you can kill the parent when a supervisor keeps reviving a port), user, CPU, MEM, threads (Linux), uptime, working directory, and the full command line. For Docker-backed ports, it adds container name, image, compose working directory, and live `docker stats` CPU / MEM. Each requested port with no listener is reported individually (`port N: no listening process found.`).
 
 ### Killing a port
 

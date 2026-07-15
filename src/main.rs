@@ -107,17 +107,28 @@ fn main() {
     //
     // Docker rows are the exception: a container published on both stacks (docker's
     // default: `0.0.0.0:P` + `[::]:P`) yields two listeners carrying identical
-    // container information, differing only in a bind address lport does not print
-    // and a docker-proxy PID visible under sudo. Merging them by container identity
-    // hides nothing, and docker rows are never kill targets.
+    // container information and a docker-proxy PID that only differs under sudo, so
+    // merging by container identity hides nothing, and docker rows are never kill
+    // targets.
+    //
+    // A merged row must still carry every address it now stands for: `127.0.0.1`-only
+    // and `[::]` (all interfaces) have very different exposure, and collapsing them to
+    // the first address alone would misreport a public listener as loopback-only. So
+    // `dedup_by` accumulates the removed row's addr onto the kept row (`b`).
     entries.dedup_by(|a, b| {
-        if a.port != b.port || a.proto != b.proto {
-            return false;
+        let same = a.port == b.port
+            && a.proto == b.proto
+            && match (&a.docker, &b.docker) {
+                (Some(da), Some(db)) => da.name == db.name && da.container_port == db.container_port,
+                _ => a.pid.is_some() && a.pid == b.pid,
+            };
+        if same && !a.addr.is_empty() && !b.addr.split(", ").any(|s| s == a.addr) {
+            if !b.addr.is_empty() {
+                b.addr.push_str(", ");
+            }
+            b.addr.push_str(&a.addr);
         }
-        if let (Some(da), Some(db)) = (&a.docker, &b.docker) {
-            return da.name == db.name && da.container_port == db.container_port;
-        }
-        a.pid.is_some() && a.pid == b.pid
+        same
     });
 
     // Info / Kill modes are single-port queries, so filter before the per-PID

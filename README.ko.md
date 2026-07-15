@@ -80,7 +80,7 @@ sudo lport               # 다른 사용자 프로세스까지 완전한 가시�
   <img src="demo/info.gif" alt="lport info" width="780"/>
 </p>
 
-`lport info PORT...`(또는 그냥 `lport PORT...`)는 요청한 포트로 먼저 필터링한 뒤 PID별 상태를 읽으므로 단일 포트 조회가 가볍습니다. 블록에는 바인드 주소(`ADDR`), 부모 프로세스(`PARENT` — 슈퍼바이저가 포트를 계속 되살릴 때 부모를 종료할 수 있게), 사용자, CPU, MEM, 스레드 수(Linux), 가동 시간, 작업 디렉터리, 전체 커맨드라인이 표시됩니다. Docker 포트라면 컨테이너 이름, 이미지, compose 작업 디렉터리, 실시간 `docker stats` CPU / MEM이 추가됩니다. 요청한 포트 중 리스너가 없는 포트는 개별적으로 보고됩니다(`port N: no listening process found.`).
+`lport info PORT...`(또는 그냥 `lport PORT...`)는 요청한 포트로 먼저 필터링한 뒤 PID별 상태를 읽으므로 단일 포트 조회가 가볍습니다. 블록에는 바인드 주소(`ADDR` — 한 포트에서 여러 주소에 바인드된 프로세스는 콤마로 나열되어 `127.0.0.1, ::`는 loopback + 전체 인터페이스로 읽힘), 부모 프로세스(`PARENT` — 슈퍼바이저가 포트를 계속 되살릴 때 부모를 종료할 수 있게), 사용자, CPU, MEM, 스레드 수(Linux), 가동 시간, 작업 디렉터리, 전체 커맨드라인이 표시됩니다. Docker 포트라면 컨테이너 이름, 이미지, compose 작업 디렉터리, 실시간 `docker stats` CPU / MEM이 추가됩니다. 요청한 포트 중 리스너가 없는 포트는 개별적으로 보고됩니다(`port N: no listening process found.`).
 
 ### 포트 종료
 
