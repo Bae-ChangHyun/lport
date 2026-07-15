@@ -96,7 +96,7 @@ fn main() {
     let mode = parse_mode(&args);
     let docker_map = load_docker_ports();
 
-    let mut entries = collect_listening(&docker_map);
+    let mut entries = collect_listening(&docker_map, true);
 
     entries.sort_by(|a, b| {
         (a.port, a.proto, a.pid.unwrap_or(0)).cmp(&(b.port, b.proto, b.pid.unwrap_or(0)))
@@ -746,7 +746,7 @@ fn warn_on_restart(
     }
     std::thread::sleep(Duration::from_millis(500));
     let mut warned: HashSet<(&'static str, u32, u32)> = HashSet::new();
-    for e in collect_listening(docker_map) {
+    for e in collect_listening(docker_map, false) {
         if e.docker.is_some() || !freed_ports.contains(&e.port) {
             continue;
         }
@@ -1028,11 +1028,15 @@ fn parse_port_range(s: &str) -> Option<(u32, u32)> {
 // Listening port collection (platform-specific)
 // ================================================================
 
+// `strict` distinguishes the primary collection — where a failing `ss` must fail
+// loudly rather than masquerade as "no ports" — from the best-effort re-scan
+// `warn_on_restart` runs after a kill: that re-scan is only there to add a warning,
+// so a transient `ss` failure must not flip an already-successful kill to exit 1.
 #[cfg(target_os = "linux")]
-fn collect_listening(docker_map: &DockerMap) -> Vec<Entry> {
+fn collect_listening(docker_map: &DockerMap, strict: bool) -> Vec<Entry> {
     let mut entries = Vec::new();
-    collect_ss("tcp", &["-tlnpH"], docker_map, &mut entries);
-    collect_ss("udp", &["-ulnpH"], docker_map, &mut entries);
+    collect_ss("tcp", &["-tlnpH"], docker_map, &mut entries, strict);
+    collect_ss("udp", &["-ulnpH"], docker_map, &mut entries, strict);
     entries
 }
 
@@ -1042,29 +1046,36 @@ fn collect_ss(
     args: &[&str],
     docker_map: &DockerMap,
     out: &mut Vec<Entry>,
+    strict: bool,
 ) {
     let output = match Command::new("ss").args(args).output() {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("error: failed to run `ss`: {}. Install iproute2 (provides `ss`).", e);
-            std::process::exit(1);
+            if strict {
+                eprintln!("error: failed to run `ss`: {}. Install iproute2 (provides `ss`).", e);
+                std::process::exit(1);
+            }
+            return;
         }
     };
     // busybox `ss` does not support `-H` and exits non-zero instead of printing
     // rows. Parsing its empty stdout would report "no listening ports" — a wrong
     // answer that looks like a right one.
     if !output.status.success() {
-        eprintln!(
-            "error: `ss {}` failed (exit {}): {}",
-            args.join(" "),
-            output
-                .status
-                .code()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "?".into()),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        std::process::exit(1);
+        if strict {
+            eprintln!(
+                "error: `ss {}` failed (exit {}): {}",
+                args.join(" "),
+                output
+                    .status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            std::process::exit(1);
+        }
+        return;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
@@ -1163,8 +1174,10 @@ fn parse_users(s: &str) -> Vec<(String, u32)> {
     out
 }
 
+// `_strict` is unused on macOS: `lsof` exits non-zero when nothing matches, which is
+// normal, so this path never exits on a non-zero status to begin with.
 #[cfg(target_os = "macos")]
-fn collect_listening(docker_map: &DockerMap) -> Vec<Entry> {
+fn collect_listening(docker_map: &DockerMap, _strict: bool) -> Vec<Entry> {
     let mut entries = Vec::new();
     collect_lsof(
         "tcp",
