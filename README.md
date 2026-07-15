@@ -12,6 +12,8 @@
 
 [Quick start](#quick-start) · [Usage](#usage) · [How it works](#how-it-works) · [Releases](https://github.com/Bae-ChangHyun/lport/releases)
 
+**English** · [한국어](README.ko.md)
+
 </div>
 
 ---
@@ -109,18 +111,6 @@ port tcp/5432: owned by Docker container 'supabase_db_supabase-prod'. Use: docke
 | `lport kill` | every target confirmed dead (or skipped by you) | no listener / Docker-backed / signal failed / survived | argument error |
 
 Exit codes survive closed pipes: `lport kill -y 3000 8080 | head -1` still signals both ports and reports honestly.
-
-### Update notice
-
-Every invocation reads `~/.cache/lport/update-check`. When a newer upstream version is cached, `lport` prints a one-line notice underneath its normal output. On a TTY it also prompts:
-
-```
-●  update available: lport 0.7.0 → 0.8.0   install now? [y/N]
-```
-
-Pressing `y` runs `cargo install --git https://github.com/Bae-ChangHyun/lport --force`; anything else (including just hitting Enter) skips. When stdout is piped or you're not on a TTY, only the notice is printed — no prompt.
-
-The cache is refreshed in the background (detached `curl` against `main`'s `Cargo.toml`, 24 h TTL) so the check never delays startup. Set `LPORT_NO_UPDATE_CHECK=1` to disable both the notice and the background fetch.
 
 ## How it works
 
