@@ -4,13 +4,13 @@
 
 **Linux와 macOS의 리스닝 포트를, 각 서버를 실행한 폴더와 함께 보여줍니다.**
 
-[![Release](https://img.shields.io/github/v/release/Bae-ChangHyun/lport?style=flat-square&color=F5B240)](https://github.com/Bae-ChangHyun/lport/releases)
+[![Release](https://img.shields.io/github/v/release/Changroro/lport?style=flat-square&color=F5B240)](https://github.com/Changroro/lport/releases)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-blue?style=flat-square)](#요구-사항)
 [![Built with](https://img.shields.io/badge/Built%20with-Rust-CE422B?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Zero deps](https://img.shields.io/badge/Dependencies-stdlib%20only-444?style=flat-square)](Cargo.toml)
 
-[빠른 시작](#빠른-시작) · [사용법](#사용법) · [작동 방식](#작동-방식) · [Releases](https://github.com/Bae-ChangHyun/lport/releases)
+[빠른 시작](#빠른-시작) · [사용법](#사용법) · [작동 방식](#작동-방식) · [Releases](https://github.com/Changroro/lport/releases)
 
 [English](README.md) · **한국어**
 
@@ -36,20 +36,20 @@
 ## 빠른 시작
 
 ```bash
-curl -sfL https://raw.githubusercontent.com/Bae-ChangHyun/lport/main/install.sh | sh
+curl -sfL https://raw.githubusercontent.com/Changroro/lport/main/install.sh | sh
 ```
 
 Rust 툴체인이 필요합니다(없으면 스크립트가 한 줄 설치법을 알려줍니다). 설치 스크립트를 다시 실행하면 디스크의 버전을 감지해 이미 최신이면 건너뛰고, `--force`를 주면 무조건 재설치합니다.
 
 ```bash
 # 신규 설치 또는 자동 업그레이드
-curl -sfL https://raw.githubusercontent.com/Bae-ChangHyun/lport/main/install.sh | sh
+curl -sfL https://raw.githubusercontent.com/Changroro/lport/main/install.sh | sh
 
 # 강제 재설치
-curl -sfL https://raw.githubusercontent.com/Bae-ChangHyun/lport/main/install.sh | sh -s -- --force
+curl -sfL https://raw.githubusercontent.com/Changroro/lport/main/install.sh | sh -s -- --force
 
 # 또는 cargo로 직접
-cargo install --git https://github.com/Bae-ChangHyun/lport
+cargo install --git https://github.com/Changroro/lport
 ```
 
 ## 사용법

@@ -1855,9 +1855,9 @@ fn group_key(e: &Entry) -> &str {
 // `LPORT_NO_UPDATE_CHECK=1` disables both halves.
 
 const UPDATE_CACHE_TTL_SECS: u64 = 24 * 3600;
-const UPDATE_REPO: &str = "https://github.com/Bae-ChangHyun/lport";
+const UPDATE_REPO: &str = "https://github.com/Changroro/lport";
 const UPDATE_RAW_CARGO_TOML: &str =
-    "https://raw.githubusercontent.com/Bae-ChangHyun/lport/main/Cargo.toml";
+    "https://raw.githubusercontent.com/Changroro/lport/main/Cargo.toml";
 
 fn maybe_print_update_notice() {
     if std::env::var_os("LPORT_NO_UPDATE_CHECK").is_some() {

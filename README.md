@@ -4,13 +4,13 @@
 
 **List listening ports on Linux and macOS — and the folder each server was launched from.**
 
-[![Release](https://img.shields.io/github/v/release/Bae-ChangHyun/lport?style=flat-square&color=F5B240)](https://github.com/Bae-ChangHyun/lport/releases)
+[![Release](https://img.shields.io/github/v/release/Changroro/lport?style=flat-square&color=F5B240)](https://github.com/Changroro/lport/releases)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-blue?style=flat-square)](#requirements)
 [![Built with](https://img.shields.io/badge/Built%20with-Rust-CE422B?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Zero deps](https://img.shields.io/badge/Dependencies-stdlib%20only-444?style=flat-square)](Cargo.toml)
 
-[Quick start](#quick-start) · [Usage](#usage) · [How it works](#how-it-works) · [Releases](https://github.com/Bae-ChangHyun/lport/releases)
+[Quick start](#quick-start) · [Usage](#usage) · [How it works](#how-it-works) · [Releases](https://github.com/Changroro/lport/releases)
 
 **English** · [한국어](README.ko.md)
 
@@ -36,20 +36,20 @@ A tiny (~550 KB, zero-dependency) Rust CLI that answers two questions you actual
 ## Quick start
 
 ```bash
-curl -sfL https://raw.githubusercontent.com/Bae-ChangHyun/lport/main/install.sh | sh
+curl -sfL https://raw.githubusercontent.com/Changroro/lport/main/install.sh | sh
 ```
 
 Requires the Rust toolchain (the script tells you how to install it in one line if missing). Re-running the installer detects the version on disk and skips work when you're already on the latest release; pass `--force` to reinstall anyway.
 
 ```bash
 # fresh install or auto-upgrade
-curl -sfL https://raw.githubusercontent.com/Bae-ChangHyun/lport/main/install.sh | sh
+curl -sfL https://raw.githubusercontent.com/Changroro/lport/main/install.sh | sh
 
 # force reinstall
-curl -sfL https://raw.githubusercontent.com/Bae-ChangHyun/lport/main/install.sh | sh -s -- --force
+curl -sfL https://raw.githubusercontent.com/Changroro/lport/main/install.sh | sh -s -- --force
 
 # or directly via cargo
-cargo install --git https://github.com/Bae-ChangHyun/lport
+cargo install --git https://github.com/Changroro/lport
 ```
 
 ## Usage

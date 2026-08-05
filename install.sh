@@ -2,7 +2,7 @@
 # lport installer (cargo-based)
 #
 # Usage:
-#   curl -sfL https://raw.githubusercontent.com/Bae-ChangHyun/lport/main/install.sh | sh
+#   curl -sfL https://raw.githubusercontent.com/Changroro/lport/main/install.sh | sh
 #
 #   # reinstall even if the installed version is already up to date:
 #   curl -sfL .../install.sh | sh -s -- --force
@@ -11,8 +11,8 @@
 
 set -e
 
-REPO="https://github.com/Bae-ChangHyun/lport"
-RAW_CARGO_TOML="https://raw.githubusercontent.com/Bae-ChangHyun/lport/main/Cargo.toml"
+REPO="https://github.com/Changroro/lport"
+RAW_CARGO_TOML="https://raw.githubusercontent.com/Changroro/lport/main/Cargo.toml"
 BIN="lport"
 
 FORCE=0
